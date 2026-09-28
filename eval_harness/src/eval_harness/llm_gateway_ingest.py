@@ -72,7 +72,7 @@ def load_gateway_pairs(log_path: Path, *, start_offset: int = 0, strict: bool = 
         slot = slot_for(cid)
         if rec.get("case_id") and not slot.get("case_id"):
             slot["case_id"] = rec.get("case_id")
-        for key in ("execution_id", "run_id", "lane_id", "attribution_status", "case_id_source", "thinking_effective", "thinking_source"):
+        for key in ("execution_id", "run_id", "harness", "started_at", "lane_id", "attribution_status", "case_id_source", "thinking_effective", "thinking_source"):
             if rec.get(key) is not None and slot.get(key) is None:
                 slot[key] = rec[key]
         ev = rec.get("event")
@@ -295,6 +295,8 @@ def pairs_to_trace_calls(pairs: list[dict[str, Any]], *, case_id: str) -> list[d
                 "case_id": case_id,
                 "execution_id": p.get("execution_id"),
                 "run_id": p.get("run_id"),
+                "harness": p.get("harness"),
+                "started_at": p.get("started_at"),
                 "lane_id": p.get("lane_id"),
                 "attribution_status": p.get("attribution_status"),
                 "case_id_source": p.get("case_id_source"),

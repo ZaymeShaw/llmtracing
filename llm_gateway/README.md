@@ -20,7 +20,7 @@ Secrets live only in `.env` / `.env.*` (gitignored). Do **not** overwrite `.env`
 | `LITELLM_HOST` / `LITELLM_PORT` | Local gateway |
 | `LITELLM_MASTER_KEY` | Local Bearer for Claude / clients |
 
-`start_litellm.sh` composes LiteLLM’s `provider/model` as `${UPSTREAM_PROTOCOL}/${UPSTREAM_MODEL}` and syncs Claude settings. Config yaml still has `model_name: "*"` so local clients can keep calling `deepseek-v4-flash` while upstream model id differs.
+`start_litellm.sh` composes LiteLLM’s `provider/model` as `${UPSTREAM_PROTOCOL}/${UPSTREAM_MODEL}` without requiring a Claude workspace. Set `LITELLM_SYNC_CLAUDE_SETTINGS=1` to opt into syncing an existing Claude settings file. Config yaml still has `model_name: "*"` so local clients can keep calling `deepseek-v4-flash` while upstream model id differs.
 
 ## Start / switch
 

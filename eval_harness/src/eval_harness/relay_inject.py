@@ -1,8 +1,8 @@
-"""Helpers to stamp eval_case_id onto traffic headed at the local relay.
+"""Helpers to stamp execution identity onto traffic headed at the local relay.
 
 Analysis does not require a harness Trace adapter. Any client that speaks
 Chat Completions / Responses / Anthropic Messages through the relay and
-carries eval_case_id (header preferred) can be sliced into wire-only HTML.
+carries case/execution labels can be sliced into execution-level HTML.
 
 Priority at the gateway (see llm_gateway/callbacks/case_id.py):
   1. Header X-Eval-Case-Id
@@ -14,6 +14,8 @@ from __future__ import annotations
 import json
 import os
 from typing import Any, Mapping, MutableMapping
+
+from eval_harness.trace_identity import trace_headers
 
 CASE_ID_HEADER = "X-Eval-Case-Id"
 EXECUTION_ID_HEADER = "X-Eval-Execution-Id"
@@ -28,7 +30,7 @@ def text_marker(case_id: str) -> str:
 
 
 def openai_compatible_kwargs(
-    case_id: str, execution_id: str | None = None, *, thinking: bool | None = None,
+    case_id: str, execution_id: str | None = None, *, thinking: bool | None = None, run_id: str | None = None, harness: str | None = None,
 ) -> dict[str, Any]:
     """Kwargs for OpenAI / Agno OpenAIChat (Chat Completions path).
 
@@ -36,7 +38,7 @@ def openai_compatible_kwargs(
         OpenAIChat(..., **openai_compatible_kwargs("bs-001"))
         # or mutate: model.extra_headers = ...; model.extra_body = ...
     """
-    headers = {CASE_ID_HEADER: case_id}
+    headers = {CASE_ID_HEADER: case_id, **trace_headers(case_id=case_id, run_id=run_id, harness=harness, execution_id=execution_id)}
     body: dict[str, Any] = {CASE_ID_BODY_FIELD: case_id}
     if execution_id:
         headers[EXECUTION_ID_HEADER] = execution_id
@@ -54,10 +56,11 @@ def openai_compatible_kwargs(
 
 
 def apply_openai_compatible_case_id(
-    model: Any, case_id: str, execution_id: str | None = None, *, thinking: bool | None = None,
+    model: Any, case_id: str, execution_id: str | None = None, *, thinking: bool | None = None, run_id: str | None = None, harness: str | None = None,
 ) -> Any:
     """Mutate an Agno/OpenAIChat-like instance in place for the current case."""
     headers = dict(getattr(model, "extra_headers", None) or {})
+    headers.update(trace_headers(case_id=case_id, run_id=run_id, harness=harness, execution_id=execution_id))
     headers[CASE_ID_HEADER] = case_id
     if execution_id:
         headers[EXECUTION_ID_HEADER] = execution_id
@@ -74,6 +77,7 @@ def apply_openai_compatible_case_id(
 
     # default_headers is also honored by the OpenAI SDK client constructor
     defaults = dict(getattr(model, "default_headers", None) or {})
+    defaults.update(trace_headers(case_id=case_id, run_id=run_id, harness=harness, execution_id=execution_id))
     defaults[CASE_ID_HEADER] = case_id
     if execution_id:
         defaults[EXECUTION_ID_HEADER] = execution_id
@@ -103,6 +107,8 @@ def anthropic_cli_env(
     *,
     execution_id: str | None = None,
     thinking: bool | None = None,
+    run_id: str | None = None,
+    harness: str | None = None,
 ) -> dict[str, str]:
     """Env for Claude Code CLI (and similar Anthropic clients using these vars).
 
@@ -111,6 +117,7 @@ def anthropic_cli_env(
     CLAUDE_CODE_EXTRA_BODY. thinking=True → header on (relay opt-in);
     thinking=False/None → omit header (relay default-off).
     """
+    execution_id = execution_id or trace_headers().get(EXECUTION_ID_HEADER)
     env: dict[str, str] = dict(base_env if base_env is not None else os.environ)
 
     existing = env.get("ANTHROPIC_CUSTOM_HEADERS", "")
@@ -119,6 +126,7 @@ def anthropic_cli_env(
         CASE_ID_HEADER.lower() + ":",
         EXECUTION_ID_HEADER.lower() + ":",
         THINKING_HEADER.lower() + ":",
+        "x-eval-run-id:", "x-eval-harness:", "x-eval-started-at:",
     )
     lines = [
         ln for ln in lines
@@ -127,6 +135,9 @@ def anthropic_cli_env(
     lines.append(f"{CASE_ID_HEADER}: {case_id}")
     if execution_id:
         lines.append(f"{EXECUTION_ID_HEADER}: {execution_id}")
+    for key, value in trace_headers(run_id=run_id, harness=harness).items():
+        if key not in (EXECUTION_ID_HEADER, CASE_ID_HEADER):
+            lines.append(f"{key}: {value}")
     if thinking is True:
         lines.append(f"{THINKING_HEADER}: on")
     env["ANTHROPIC_CUSTOM_HEADERS"] = "\n".join(lines)

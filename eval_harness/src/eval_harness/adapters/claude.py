@@ -1,6 +1,8 @@
 """Spawn Claude Code CLI, capture stream-json, multi-turn resume."""
 from __future__ import annotations
 
+from eval_harness.trace_identity import current_identity
+
 import json
 import re
 import uuid
@@ -509,7 +511,7 @@ def run_case(
     claude_config_dir: Optional[str] = None,
 ) -> CaseRunResult:
     case_dir.mkdir(parents=True, exist_ok=True)
-    execution_id = uuid.uuid4().hex
+    execution_id = current_identity().get("execution_id") or uuid.uuid4().hex
     # Layer-1: agent cwd = <agent_workdir_root>/claude/<execution_id>/ (outside the repo);
     # profile project_cwd is only the template for agent.md/.mcp.json/.claude settings.
     template_cwd = Path(project_cwd)

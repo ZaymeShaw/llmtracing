@@ -1,6 +1,9 @@
 """Shareable LLM trace HTML: case → call picker, one detail pane (no endless scroll)."""
 from __future__ import annotations
 
+from eval_harness.protocol_trace import request_fields, response_fields, usage_fields
+from eval_harness.trace_store import identity_key, identity_start, read_identity
+
 import html
 import json
 import re
@@ -64,109 +67,8 @@ def _parse_model_response(s: Any) -> dict[str, Any]:
     """Parse assistant content/tool_calls/thinking from dict or legacy ModelResponse repr."""
     empty = {"content": "", "tool_calls": [], "thinking": ""}
 
-    def _from_chat_message(msg: dict) -> dict[str, Any]:
-        tcs = []
-        for tc in msg.get("tool_calls") or []:
-            if isinstance(tc, dict):
-                fn = tc.get("function") if isinstance(tc.get("function"), dict) else tc
-                if isinstance(fn, dict):
-                    tcs.append(
-                        {
-                            "name": str(fn.get("name") or tc.get("name") or ""),
-                            "arguments": str(fn.get("arguments") or tc.get("arguments") or ""),
-                        }
-                    )
-        thinking = ""
-        if msg.get("reasoning_content"):
-            thinking = str(msg.get("reasoning_content"))
-        blocks = msg.get("thinking_blocks")
-        if isinstance(blocks, list) and blocks:
-            parts = []
-            for b in blocks:
-                if isinstance(b, dict) and b.get("thinking"):
-                    parts.append(str(b["thinking"]))
-                elif isinstance(b, dict) and b.get("text"):
-                    parts.append(str(b["text"]))
-            if parts:
-                thinking = "\n".join(parts) if not thinking else thinking
-        content = msg.get("content")
-        if content is None:
-            content = ""
-        elif not isinstance(content, str):
-            content = _text_from_content(content)
-        return {"content": str(content), "tool_calls": tcs, "thinking": thinking}
-
-    def _from_anthropic_content(content: Any) -> dict[str, Any]:
-        texts: list[str] = []
-        thinking_parts: list[str] = []
-        tcs: list[dict[str, str]] = []
-        if isinstance(content, list):
-            for b in content:
-                if not isinstance(b, dict):
-                    texts.append(str(b))
-                    continue
-                t = b.get("type")
-                if t == "text":
-                    texts.append(str(b.get("text") or ""))
-                elif t in ("thinking", "reasoning"):
-                    thinking_parts.append(str(b.get("thinking") or b.get("text") or ""))
-                elif t == "tool_use":
-                    tcs.append(
-                        {
-                            "name": str(b.get("name") or ""),
-                            "arguments": json.dumps(b.get("input") or {}, ensure_ascii=False, default=str),
-                        }
-                    )
-                else:
-                    texts.append(json.dumps(b, ensure_ascii=False, default=str))
-        elif isinstance(content, str):
-            texts.append(content)
-        return {
-            "content": "\n".join(texts),
-            "tool_calls": tcs,
-            "thinking": "\n".join(thinking_parts),
-        }
-
-    def _from_responses_output(output: Any) -> dict[str, Any]:
-        texts: list[str] = []
-        thinking_parts: list[str] = []
-        tcs: list[dict[str, str]] = []
-        if not isinstance(output, list):
-            return {"content": json.dumps(output, ensure_ascii=False, default=str)[:5000], "tool_calls": [], "thinking": ""}
-        for item in output:
-            if not isinstance(item, dict):
-                continue
-            itype = item.get("type")
-            if itype == "message":
-                for b in item.get("content") or []:
-                    if isinstance(b, dict) and b.get("type") in ("output_text", "text"):
-                        texts.append(str(b.get("text") or ""))
-            elif itype in ("function_call", "tool_call"):
-                tcs.append(
-                    {
-                        "name": str(item.get("name") or ""),
-                        "arguments": str(item.get("arguments") or item.get("input") or ""),
-                    }
-                )
-            elif itype in ("reasoning", "thinking"):
-                thinking_parts.append(str(item.get("summary") or item.get("content") or item))
-        return {"content": "\n".join(texts), "tool_calls": tcs, "thinking": "\n".join(thinking_parts)}
-
     if isinstance(s, dict):
-        choices = s.get("choices") or []
-        if choices and isinstance(choices[0], dict):
-            msg = choices[0].get("message") or {}
-            if isinstance(msg, dict):
-                return _from_chat_message(msg)
-        if "content" in s and s.get("type") in (None, "message") and "choices" not in s:
-            # Anthropic Messages response shape
-            out = _from_anthropic_content(s.get("content"))
-            if s.get("stop_reason") and not out["content"] and not out["tool_calls"]:
-                out["content"] = json.dumps(s, ensure_ascii=False, default=str)[:5000]
-            return out
-        if "output" in s:
-            return _from_responses_output(s.get("output"))
-        return {"content": json.dumps(s, ensure_ascii=False, default=str)[:5000], "tool_calls": [], "thinking": ""}
+        return response_fields(s)
 
     if not isinstance(s, str) or not s:
         return dict(empty)
@@ -257,22 +159,11 @@ def _est_tokens(text: str) -> int:
 
 def _parse_usage(usage) -> dict:
     """Normalize LiteLLM usage dict or Usage(...) repr."""
+    extracted = usage_fields(usage)
+    if extracted is not None:
+        return extracted
     out = {}
     if usage is None or usage == "":
-        return out
-    if isinstance(usage, dict):
-        for k in (
-            "prompt_tokens",
-            "completion_tokens",
-            "total_tokens",
-            "cache_read_input_tokens",
-            "cache_creation_input_tokens",
-        ):
-            if usage.get(k) is not None:
-                out[k] = usage.get(k)
-        details = usage.get("prompt_tokens_details")
-        if isinstance(details, dict) and details.get("cached_tokens") is not None:
-            out["cached_tokens"] = details.get("cached_tokens")
         return out
     s = str(usage)
     for k in (
@@ -702,40 +593,28 @@ def _input_context_stats(*, system: str, messages: list, tools, usage: dict) -> 
 def _normalize_call(raw: dict[str, Any]) -> dict[str, Any]:
     req = raw.get("request") if isinstance(raw.get("request"), dict) else {}
     resp = raw.get("response") if isinstance(raw.get("response"), dict) else {}
-    op = req.get("optional_params") if isinstance(req.get("optional_params"), dict) else {}
-    system = op.get("system")
-    if isinstance(system, list):
-        system = _text_from_content(system)
-    elif system is None:
-        system = ""
-    else:
-        system = str(system)
-
-    msgs = _messages(req.get("messages"))
-    # Agno / Chat Completions often put system in messages, not optional_params.system
-    if not str(system or "").strip():
-        for m in msgs:
-            if isinstance(m, dict) and m.get("role") == "system" and (m.get("text") or "").strip():
-                system = m["text"]
-                break
+    fields = request_fields(req)
+    system = fields["system"]
+    msgs = fields["messages"]
     last = msgs[-1]["text"] if msgs else ""
-    assistant = _parse_model_response(resp.get("response"))
-    names = _tool_names(req.get("tools"))
-    usage = _parse_usage(resp.get("usage"))
+    response_obj = resp.get("response", raw.get("response"))
+    assistant = _parse_model_response(response_obj)
+    names = _tool_names(fields["tools"])
+    usage = _parse_usage(resp.get("usage") or (response_obj.get("usage") if isinstance(response_obj, dict) else None))
     context_stats = _input_context_stats(
         system=system,
         messages=msgs,
-        tools=req.get("tools"),
+        tools=fields["tools"],
         usage=usage,
     )
 
     ts_start = raw.get("ts") or req.get("ts")
     ts_end = resp.get("ts")
-    tools_brief = _tools_brief(req.get("tools"))
+    tools_brief = _tools_brief(fields["tools"])
     return {
         "seq": raw.get("seq"),
         "call_id": raw.get("call_id"),
-        **{key: raw[key] for key in ("execution_id", "lane_id", "attribution_status") if raw.get(key) is not None},
+        **{key: raw[key] for key in ("execution_id", "run_id", "harness", "lane_id", "attribution_status") if raw.get(key) is not None},
         "protocol": raw.get("protocol") or req.get("protocol") or resp.get("protocol"),
         "model": raw.get("model") or req.get("model"),
         "latency_ms": raw.get("latency_ms") or resp.get("latency_ms"),
@@ -749,27 +628,23 @@ def _normalize_call(raw: dict[str, Any]) -> dict[str, Any]:
         "assistant": assistant.get("content") or "",
         "thinking": assistant.get("thinking") or "",
         "tool_calls": assistant.get("tool_calls") or [],
+        **{k: assistant.get(k) for k in ("stop_reason", "response_status", "response_id", "response_error", "incomplete_details")},
+        "previous_response_id": fields["previous_response_id"],
         "usage": usage,
         "context_stats": context_stats,
         "label": f"#{raw.get('seq')} · {_preview(last or assistant.get('content') or '(empty)', 56)}",
         "raw_request": {
-            "model": req.get("model"),
-            "messages": req.get("messages"),
-            "optional_params": {
-                k: v for k, v in op.items() if k != "tools"
-            }
-            if op
-            else {},
+            **req,
             "tool_names": names,
             "n_tools": len(names),
             "tools_brief": tools_brief,
             # full tool schemas (smoke-era gap: previously dropped → thin Raw)
-            "tools": req.get("tools"),
+            "tools": fields["tools"],
         },
         "raw_response": {
             "usage": _structure_litellm_value(resp.get("usage")),
             "latency_ms": resp.get("latency_ms"),
-            "response": _structure_litellm_value(resp.get("response")),
+            "response": _structure_litellm_value(response_obj),
         },
     }
 
@@ -884,12 +759,6 @@ def _wire_only_overview(case_dir: Path, calls: list[dict[str, Any]]) -> dict[str
     error = meta.get("error")
     cost = meta.get("cost_usd")
     meta_wall = meta.get("wall_ms") or meta.get("ms")
-    if meta_wall is not None:
-        try:
-            mw = int(meta_wall)
-            wall_ms = mw if wall_ms is None else max(int(wall_ms), mw)
-        except Exception:
-            pass
     resp_obj = meta.get("response") if isinstance(meta.get("response"), dict) else {}
     answer = meta.get("final_text") or meta.get("answer") or resp_obj.get("answer")
     if answer:
@@ -925,16 +794,18 @@ def _wire_only_overview(case_dir: Path, calls: list[dict[str, Any]]) -> dict[str
     return {
         "available": True,
         "wire_only": True,
+        "execution_metadata": bool(meta),
         "case_id": case_dir.name,
         "success": success,
         "exit_code": exit_code,
         "error": error,
         "metrics": {
-            "wall_ms": wall_ms,
+            "wall_ms": meta_wall,
+            "model_span_ms": wall_ms,
             "api_ms": int(sum(latencies)) if latencies else None,
             "first_frame_ms": first_frame_ms,
             "first_frame_kind": first_frame_kind,
-            "num_turns": len(turns) if turns else None,
+            "num_turns": None,
             "num_tool_calls": len(tool_timeline),
             "num_llm_calls": len(normalized),
             "thinking_present": thinking_present,
@@ -966,12 +837,13 @@ def _load_case_overview(case_dir: Path, *, calls: list[dict[str, Any]] | None = 
                 pass
         insurance_meta = (
             isinstance(meta, dict)
-            and meta.get("case_id") == case_dir.name
+            and meta.get("case_id") == read_identity(case_dir, wire_calls).get("case_id")
             and "attribution_status" in meta
         )
         if wire_calls:
             overview = _wire_only_overview(case_dir, wire_calls)
             if insurance_meta:
+                overview["execution_metadata"] = True
                 meta_turns = meta.get("turns") if isinstance(meta.get("turns"), list) else []
                 overview["turns"] = [
                     {
@@ -1269,7 +1141,7 @@ def _enrich_overview(overview: dict[str, Any], calls: list[dict[str, Any]], case
                 n += len(c.get("tool_calls") or [])
             metrics["num_tool_calls"] = n
 
-    ff_ms, ff_kind = _infer_first_frame(case_dir, calls, overview)
+    ff_ms, ff_kind = (None, None) if overview.get("wire_only") else _infer_first_frame(case_dir, calls, overview)
     if ff_ms is not None:
         metrics["first_frame_ms"] = ff_ms
         metrics["first_frame_kind"] = ff_kind
@@ -1369,10 +1241,13 @@ def build_payload(run_dir: Path) -> dict[str, Any]:
     cases_root = Path(run_dir) / "cases"
     cases: list[dict[str, Any]] = []
     if cases_root.is_dir():
-        for case_dir in sorted(p for p in cases_root.iterdir() if p.is_dir()):
+        directories = list(p for p in cases_root.iterdir() if p.is_dir())
+        directories += [p for parent in list(directories) for p in (parent / "attempts").glob("*") if p.is_dir()]
+        for case_dir in sorted(directories):
             raw_calls = _load_calls(case_dir)
-            if not raw_calls and not (case_dir / "meta.json").is_file():
+            if not raw_calls and not any((case_dir / name).is_file() for name in ("meta.json", "trace.json", "identity.json")):
                 continue
+            identity = read_identity(case_dir, raw_calls)
             calls = [_normalize_call(c) for c in raw_calls]
             # Context growth: delta vs previous LLM call (scheme wire-only must-have)
             for i, call in enumerate(calls):
@@ -1405,8 +1280,6 @@ def build_payload(run_dir: Path) -> dict[str, Any]:
                 }
             _enrich_calls_thinking(case_dir, calls)
             overview = _load_case_overview(case_dir, calls=raw_calls)
-            if not raw_calls and not overview.get("runner_only"):
-                continue
             if overview.get("wire_only"):
                 wire_events = _wire_events_from_calls(calls)
                 overview["n_events"] = len(wire_events)
@@ -1414,13 +1287,28 @@ def build_payload(run_dir: Path) -> dict[str, Any]:
             overview = _enrich_overview(overview, calls, case_dir)
             cases.append(
                 {
-                    "id": case_dir.name,
+                    "id": identity_key(identity) if identity.get("execution_id") else case_dir.name,
+                    "identity": identity,
+                    "artifact_path": str(case_dir.relative_to(run_dir)),
+                    "label": " / ".join(str(identity.get(k) or "未标记") for k in ("run_id", "harness", "case_id")),
                     "n_calls": len(calls),
                     "preview": calls[0]["label"] if calls else "评测器输入输出；模型调用未观测到",
                     "calls": calls,
                     "overview": overview,
                 }
             )
+    groups = {}
+    for case in cases:
+        ident = case["identity"]
+        key = tuple(ident.get(k) for k in ("run_id", "harness", "case_id"))
+        if not ident.get("execution_id") or not ident.get("run_id"):
+            key += (case["id"],)  # Unattributed legacy calls are not inferred retries.
+        groups.setdefault(key, []).append(case)
+    for rows in groups.values():
+        rows.sort(key=lambda c: (identity_start(c["identity"]), c["id"]))
+        for index, case in enumerate(rows):
+            case["attempt"] = index + 1
+            case["latest"] = index == len(rows) - 1
     return {"run_id": Path(run_dir).name, "cases": cases}
 
 
@@ -1546,7 +1434,9 @@ def build_llm_trace_html(run_dir: Path, *, title: Optional[str] = None) -> Path:
     <div class="head">
       <h1>Cases</h1>
       <div class="sub" id="runMeta"></div>
-      <input class="search" id="caseFilter" placeholder="筛选 case…"/>
+      <select class="search" id="batchFilter" aria-label="批次"><option value="">全部批次</option></select>
+      <input class="search" id="caseFilter" placeholder="筛选题目 / harness…"/>
+      <label><input type="checkbox" id="showHistory"/> 显示历史尝试</label>
     </div>
     <ul class="list" id="caseList"></ul>
   </aside>
@@ -1574,12 +1464,22 @@ def build_llm_trace_html(run_dir: Path, *, title: Optional[str] = None) -> Path:
 <script id="DATA" type="application/json">{data_json}</script>
 <script>
 const DATA = JSON.parse(document.getElementById('DATA').textContent);
+const batchFilter = document.getElementById('batchFilter');
+for (const run of [...new Set(DATA.cases.map(c => c.identity?.run_id || '未标记批次'))]) {{
+  const opt = document.createElement('option'); opt.value = run; opt.textContent = run; batchFilter.appendChild(opt);
+}}
+function visibleCases() {{
+  const batch = batchFilter.value;
+  const history = document.getElementById('showHistory').checked;
+  return DATA.cases.filter(c => (!batch || (c.identity?.run_id || '未标记批次') === batch) && (history || c.latest !== false));
+}}
+function caseLabel(c) {{ return (c.label || c.id) + (c.attempt > 1 || c.latest === false ? ' · 尝试 ' + c.attempt : ''); }}
 let caseIdx = -1, callIdx = -1; // -1 = 整案总览
 
 const caseList = document.getElementById('caseList');
 const callList = document.getElementById('callList');
 const runMeta = document.getElementById('runMeta');
-runMeta.textContent = DATA.run_id + ' · ' + DATA.cases.length + ' cases';
+runMeta.textContent = DATA.run_id + ' · ' + visibleCases().length + ' / ' + DATA.cases.length + ' 次执行';
 
 function esc(s) {{
   return String(s ?? '').replace(/[&<>"']/g, c => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]));
@@ -1634,11 +1534,11 @@ function renderCallTimeline(calls, title) {{
 }}
 function renderRunTimeline() {{
   const rows = [];
-  for (const c of DATA.cases) {{
+  for (const c of visibleCases()) {{
     for (const call of (c.calls || [])) {{
       const sp = callSpan(call);
       if (sp.start == null) continue;
-      rows.push({{ case_id: c.id, seq: call.seq, ...sp }});
+      rows.push({{ case_id: caseLabel(c), seq: call.seq, ...sp }});
     }}
   }}
   rows.sort((a, b) => a.start - b.start);
@@ -1653,7 +1553,9 @@ function renderRunTimeline() {{
   for (const r of rows) {{
     const left = ((r.start - t0) / span) * 100;
     const width = Math.max(0.8, (((r.end != null ? r.end : r.start) - r.start) / span) * 100);
-    const gapTxt = prevEnd != null ? (' | gap ' + fmtDur(r.start - prevEnd)) : '';
+    const gapTxt = prevEnd != null
+      ? (r.start < prevEnd ? ' | 并行重叠 ' + fmtDur(prevEnd - r.start) : ' | 间隔 ' + fmtDur(r.start - prevEnd))
+      : '';
     html += '<div class="tl-row"><code>' + esc(r.case_id) + '#' + esc(r.seq) + '</code>';
     html += '<div class="tl-track"><div class="tl-bar" style="left:' + left + '%;width:' + width + '%"></div></div>';
     html += '<span class="tl-meta">' + fmtClock(r.start) + ' -> ' + fmtClock(r.end) + ' | ' + fmtDur(r.latency) + gapTxt + '</span></div>';
@@ -1661,12 +1563,12 @@ function renderRunTimeline() {{
   }}
   html += '<div class="tl-axis"><span>' + fmtClock(t0) + '</span><span>' + fmtDur(span) + '</span><span>' + fmtClock(t1) + '</span></div></div>';
   html += '<div class="msg"><div class="role">case windows</div><pre>';
-  for (const c of DATA.cases) {{
+  for (const c of visibleCases()) {{
     const spans = (c.calls || []).map(callSpan).filter(s => s.start != null);
-    if (!spans.length) {{ html += c.id + ': -\\\n'; continue; }}
+    if (!spans.length) {{ html += esc(caseLabel(c)) + ': -\\\n'; continue; }}
     const a = Math.min(...spans.map(s => s.start));
     const b = Math.max(...spans.map(s => (s.end != null ? s.end : s.start)));
-    html += c.id + ': ' + fmtClock(a) + ' -> ' + fmtClock(b) + ' (span ' + fmtDur(b - a) + ', ' + spans.length + ' calls)\\\n';
+    html += esc(caseLabel(c)) + ': ' + fmtClock(a) + ' -> ' + fmtClock(b) + ' (span ' + fmtDur(b - a) + ', ' + spans.length + ' calls)\\\n';
   }}
   html += '</pre></div>';
   return html;
@@ -1683,12 +1585,13 @@ function setOverviewTabs(isOverview) {{
 }}
 
 function renderCases(filter = '') {{
+  runMeta.textContent = DATA.run_id + ' · ' + visibleCases().length + ' / ' + DATA.cases.length + ' 次执行';
   const q = filter.trim().toLowerCase();
   caseList.innerHTML = '';
   if (!q) {{
     const li = document.createElement('li');
     if (caseIdx === -1) li.classList.add('active');
-    li.innerHTML = '<strong>全量时间线</strong><span class="meta">' + DATA.cases.length + ' cases</span>';
+    li.innerHTML = '<strong>模型调用时间线</strong><span class="meta">' + visibleCases().length + ' 次执行</span>';
     li.onclick = () => {{
       caseIdx = -1; callIdx = -1;
       location.hash = 'timeline';
@@ -1698,11 +1601,12 @@ function renderCases(filter = '') {{
     caseList.appendChild(li);
   }}
   DATA.cases.forEach((c, i) => {{
-    if (q && !c.id.toLowerCase().includes(q)) return;
+    if (!visibleCases().includes(c)) return;
+    if (q && !caseLabel(c).toLowerCase().includes(q)) return;
     const li = document.createElement('li');
     li.dataset.i = i;
     if (i === caseIdx) li.classList.add('active');
-    li.innerHTML = `<strong>${{esc(c.id)}}</strong><span class="meta">${{c.n_calls}} calls · ${{esc(c.preview)}}</span>`;
+    li.innerHTML = `<strong>${{esc(caseLabel(c))}}</strong><span class="meta">${{c.n_calls}} calls${{c.latest && c.attempt > 1 ? " · 最新" : ""}} · ${{esc(c.preview)}}</span>`;
     li.onclick = () => {{
       caseIdx = i; callIdx = -1;
       location.hash = DATA.cases[i].id + '/overview';
@@ -1724,7 +1628,7 @@ function renderCalls() {{
     callList.appendChild(li);
     return;
   }}
-  document.getElementById('callMeta').textContent = c ? (c.id + ' · overview') : 'pick case';
+  document.getElementById('callMeta').textContent = c ? (caseLabel(c) + ' · overview') : 'pick case';
   if (!c) return;
 
   const ovLi = document.createElement('li');
@@ -1760,6 +1664,7 @@ document.getElementById('tabs').onclick = (e) => {{
 }};
 
 document.getElementById('caseFilter').oninput = (e) => renderCases(e.target.value);
+batchFilter.onchange = document.getElementById('showHistory').onchange = () => {{ caseIdx = -1; callIdx = -1; renderCases(document.getElementById('caseFilter').value); renderCalls(); renderDetail(); }};
 
 function renderOverview(c) {{
   const bar = document.getElementById('detailBar');
@@ -1772,7 +1677,7 @@ function renderOverview(c) {{
   const tok = (n) => (n == null || n === '' ? '—' : Number(n).toLocaleString());
   setOverviewTabs(true);
   if (!ov.available) {{
-    bar.textContent = c.id + ' · 整案总览不可用';
+    bar.textContent = caseLabel(c) + ' · 整案总览不可用';
     ctx.innerHTML = `<div class="empty">${{esc(ov.error || '无 case 总览')}}</div>`;
     reply.innerHTML = tools.innerHTML = raw.innerHTML = '<div class="empty">—</div>';
     setTab('context');
@@ -1783,8 +1688,9 @@ function renderOverview(c) {{
     : (ov.success === false
       ? '<span style="color:#b91c1c">FAIL</span>'
       : '<span style="color:#64748b">—</span>');
-  bar.innerHTML = `<strong>${{esc(c.id)}}</strong> · 整案总览 · `
+  bar.innerHTML = `<strong>${{esc(caseLabel(c))}}</strong> · 整案总览 · `
     + statusHtml
+    + (ov.wire_only && !ov.execution_metadata ? " · 模型调用观测（执行状态未上报）" : "")
     + ` · exit=${{ov.exit_code == null ? '—' : esc(ov.exit_code)}}`
     + ` · wall=${{tok(m.wall_ms)}}ms · api=${{tok(m.api_ms)}}ms`
     + ` · first_frame=${{tok(m.first_frame_ms)}}ms`
@@ -1792,7 +1698,7 @@ function renderOverview(c) {{
     + ` · llm=${{tok(m.num_llm_calls ?? c.n_calls)}} · tools=${{tok(m.num_tool_calls)}}`;
 
   let ctxHtml = `<div class="stats">
-    <div><div class="k">wall_ms</div><div class="v">${{tok(m.wall_ms)}}</div></div>
+    <div><div class="k">${{ov.wire_only && !ov.execution_metadata ? "模型调用跨度 ms" : "wall_ms"}}</div><div class="v">${{tok(ov.wire_only && !ov.execution_metadata ? m.model_span_ms : m.wall_ms)}}</div></div>
     <div><div class="k">api_ms</div><div class="v">${{tok(m.api_ms)}}</div></div>
     <div><div class="k">first_frame_ms</div><div class="v">${{tok(m.first_frame_ms)}}${{m.first_frame_kind ? ' (' + esc(m.first_frame_kind) + ')' : ''}}</div></div>
     <div><div class="k">num_turns</div><div class="v">${{tok(m.num_turns)}}</div></div>
@@ -1810,8 +1716,8 @@ function renderOverview(c) {{
     ctxHtml += '<div class="empty">无 turns（缺 prompt/final）</div>';
   }} else {{
     turns.forEach(t => {{
-      ctxHtml += `<div class="msg"><div class="role">turn ${{esc(t.index)}} · 输入 prompt</div><pre>${{esc(t.prompt || '')}}</pre></div>`;
-      ctxHtml += `<div class="msg assistant"><div class="role">turn ${{esc(t.index)}} · 输出 final_text</div><pre>${{esc(t.final_text || '')}}</pre></div>`;
+      ctxHtml += `<div class="msg"><div class="role">${{ov.wire_only && !ov.execution_metadata ? "首个观测输入" : "turn " + esc(t.index) + " · 输入 prompt"}}</div><pre>${{esc(t.prompt || '')}}</pre></div>`;
+      ctxHtml += `<div class="msg assistant"><div class="role">${{ov.wire_only && !ov.execution_metadata ? "最后模型回复" : "turn " + esc(t.index) + " · 输出 final_text"}}</div><pre>${{esc(t.final_text || '')}}</pre></div>`;
     }});
   }}
   const evs = ov.events || [];
@@ -1835,7 +1741,7 @@ function renderOverview(c) {{
   ctx.innerHTML = ctxHtml;
 
   reply.innerHTML = turns.length
-    ? turns.map(t => `<div class="msg assistant"><div class="role">turn ${{esc(t.index)}} final</div><pre>${{esc(t.final_text || '')}}</pre></div>`).join('')
+    ? turns.map(t => `<div class="msg assistant"><div class="role">${{ov.wire_only && !ov.execution_metadata ? "最后模型回复" : "turn " + esc(t.index) + " final"}}</div><pre>${{esc(t.final_text || '')}}</pre></div>`).join('')
     : '<div class="empty">无最终输出</div>';
 
   const tl = ov.tool_timeline || [];
@@ -1844,7 +1750,7 @@ function renderOverview(c) {{
     : '<div class="empty">无工具摘要</div>';
 
   const slim = {{
-    case_id: ov.case_id, success: ov.success, exit_code: ov.exit_code, error: ov.error,
+    identity: c.identity, case_id: ov.case_id, success: ov.success, exit_code: ov.exit_code, error: ov.error,
     metrics: ov.metrics, turns: ov.turns, tool_timeline: ov.tool_timeline,
     artifacts: ov.artifacts, n_events: ov.n_events,
     events: ov.events, note: ov.note, wire_only: ov.wire_only, runner_only: ov.runner_only,
@@ -1852,10 +1758,10 @@ function renderOverview(c) {{
   }};
   raw.innerHTML = `<div class="msg"><pre>${{esc(JSON.stringify(slim, null, 2))}}</pre></div>`
     + (ov.runner_only
-      ? `<p class="sub">评测器产物：cases/${{esc(c.id)}}/meta.json、response.json</p>`
+      ? `<p class="sub">评测器产物：${{esc(c.artifact_path || ("cases/" + c.id))}}/meta.json、response.json</p>`
       : (ov.wire_only
         ? `<p class="sub">wire-only 总览 · llm_calls.jsonl</p>`
-        : `<p class="sub">Trace：cases/${{esc(c.id)}}/trace.json</p>`));
+        : `<p class="sub">Trace：${{esc(c.artifact_path || ("cases/" + c.id))}}/trace.json</p>`));
   setTab('context');
 }}
 
@@ -1867,19 +1773,19 @@ function renderDetail() {{
   const raw = document.getElementById('pane-raw');
   if (caseIdx < 0) {{
     setOverviewTabs(true);
-    bar.innerHTML = '<strong>全量时间线</strong> · ' + DATA.cases.length + ' cases';
+    bar.innerHTML = '<strong>模型调用时间线</strong> · ' + visibleCases().length + ' 次执行';
     ctx.innerHTML = renderRunTimeline();
     let sum = '';
-    for (const c of DATA.cases) {{
+    for (const c of visibleCases()) {{
       const spans = (c.calls || []).map(callSpan).filter(s => s.start != null);
       if (!spans.length) continue;
       const a = Math.min(...spans.map(s => s.start));
       const b = Math.max(...spans.map(s => (s.end != null ? s.end : s.start)));
-      sum += '<div class="msg"><div class="role">' + esc(c.id) + '</div><pre>' + fmtClock(a) + ' → ' + fmtClock(b) + ' · ' + spans.length + ' calls</pre></div>';
+      sum += '<div class="msg"><div class="role">' + esc(caseLabel(c)) + '</div><pre>' + fmtClock(a) + ' → ' + fmtClock(b) + ' · ' + spans.length + ' calls</pre></div>';
     }}
     reply.innerHTML = sum || '<div class="empty">-</div>';
     tools.innerHTML = '<div class="empty">gaps on timeline</div>';
-    raw.innerHTML = '<div class="msg"><pre>' + esc(JSON.stringify(DATA.cases.map(c => ({{ id: c.id, calls: (c.calls || []).map(x => ({{ seq: x.seq, ts_start: x.ts_start, ts_end: x.ts_end, latency_ms: x.latency_ms }})) }})), null, 2)) + '</pre></div>';
+    raw.innerHTML = '<div class="msg"><pre>' + esc(JSON.stringify(visibleCases().map(c => ({{ id: c.id, identity: c.identity, calls: (c.calls || []).map(x => ({{ seq: x.seq, ts_start: x.ts_start, ts_end: x.ts_end, latency_ms: x.latency_ms }})) }})), null, 2)) + '</pre></div>';
     setTab('context');
     return;
   }}
@@ -1912,8 +1818,11 @@ function renderDetail() {{
       : (growth.messages_chars_delta != null
         ? ` · Δmsg_chars=${{growth.messages_chars_delta >= 0 ? '+' : ''}}${{growth.messages_chars_delta}}`
         : ''));
-  bar.innerHTML = '<strong>' + esc(c.id) + '</strong> · seq=' + esc(call.seq)
+  bar.innerHTML = '<strong>' + esc(caseLabel(c)) + '</strong> · seq=' + esc(call.seq)
     + (call.execution_id ? ' · execution=' + esc(call.execution_id) : '')
+    + (call.stop_reason ? ' · stop=' + esc(call.stop_reason) : '')
+    + (call.response_status ? ' · status=' + esc(call.response_status) : '')
+    + (call.previous_response_id ? ' · previous_response=' + esc(call.previous_response_id) : '')
     + (call.protocol ? ' · ' + esc(call.protocol) : '')
     + ' · ' + esc(call.model || '')
     + ' · ' + fmtClock(sp.start) + ' → ' + fmtClock(sp.end) + ' · lat=' + fmtDur(sp.latency)
@@ -1950,7 +1859,9 @@ function renderDetail() {{
     if (call.system && m.role === 'system' && (m.text || '') === call.system) return;
     const n = (m.text || '').length;
     let body = m.text || '';
-    if (!body && m.role === 'assistant') body = '(本条无文本；见右侧 tool_calls / thinking)';
+    if (m.tool_calls?.length) body += (body ? '\\n' : '') + JSON.stringify(m.tool_calls, null, 2);
+    if (m.tool_call_id) body = 'tool_call_id: ' + m.tool_call_id + '\\n' + body;
+    if (!body && m.role === 'assistant') body = '(本条无文本)';
     ctxHtml += `<div class="msg"><div class="role">${{esc(m.role)}} · ${{n}} 字 / 约 ${{tok(Math.max(1, Math.round((body||'').split('').reduce((a,ch)=>a+(/[\u4e00-\u9fff]/.test(ch)?1:0.3),0))))}} tok · #${{i+1}}</div><pre>${{esc(body)}}</pre></div>`;
   }});
   ctx.innerHTML = ctxHtml || '<div class="empty">无 messages</div>';
@@ -1961,11 +1872,12 @@ function renderDetail() {{
   }}
   replyHtml += `<div class="msg assistant"><div class="role">assistant</div><pre>${{esc(call.assistant || '(空)')}}</pre></div>`;
   (call.tool_calls || []).forEach(t => {{
-    replyHtml += `<div class="tool"><code>${{esc(t.name)}}</code><pre>${{esc(t.arguments)}}</pre></div>`;
+    replyHtml += `<div class="tool"><code>${{esc(t.name)}} ${{esc(t.id || "")}}</code><pre>${{esc(t.arguments)}}</pre></div>`;
   }});
   if (call.usage && Object.keys(call.usage).length) {{
     replyHtml += `<div class="msg"><div class="role">usage</div><pre>${{esc(JSON.stringify(call.usage, null, 2))}}</pre></div>`;
   }}
+  if (call.response_error || call.incomplete_details) replyHtml += `<div class="tool"><pre>${{esc(JSON.stringify(call.response_error || call.incomplete_details, null, 2))}}</pre></div>`;
   if (call.error) replyHtml += `<div class="tool"><strong>error</strong><pre>${{esc(call.error)}}</pre></div>`;
   reply.innerHTML = replyHtml;
 
@@ -1986,7 +1898,7 @@ function renderDetail() {{
     + `<h4>request（含 tools 全文 + messages）</h4><div class="msg"><pre>${{esc(JSON.stringify(call.raw_request, null, 2))}}</pre></div>`
     + `<h4>response（结构化）</h4><div class="msg"><pre>${{esc(JSON.stringify(call.raw_response, null, 2))}}</pre></div>`
     + `<h4>usage</h4><div class="msg"><pre>${{esc(JSON.stringify(call.usage || {{}}, null, 2))}}</pre></div>`
-    + `<p class="sub">完整原始文件：cases/${{esc(c.id)}}/llm_calls.jsonl</p>`;
+    + `<p class="sub">完整原始文件：${{esc(c.artifact_path || ("cases/" + c.id))}}/llm_calls.jsonl</p>`;
   setTab('context');
 }}
 
@@ -1999,6 +1911,8 @@ function applyHash() {{
   const seqStr = parts[1];
   const ci = DATA.cases.findIndex(c => c.id === cid);
   if (ci < 0) return;
+  if (DATA.cases[ci].latest === false) document.getElementById('showHistory').checked = true;
+  if (batchFilter.value && batchFilter.value !== (DATA.cases[ci].identity?.run_id || '未标记批次')) batchFilter.value = '';
   caseIdx = ci;
   if (seqStr == null || seqStr === '' || seqStr === 'overview') {{
     callIdx = -1;
@@ -2167,48 +2081,19 @@ def materialize_wire_run(
     out_run_dir: Path,
     case_ids: list[str] | None = None,
     include_orphans: bool = False,
+    run_id: str | None = None,
+    execution_ids: list[str] | None = None,
 ) -> Path:
-    """Phase 1 helper: slice gateway llm_calls into a run dir and build HTML (no Trace)."""
-    from eval_harness.llm_gateway_ingest import (
-        filter_pairs_by_case_id,
-        load_gateway_pairs,
-        orphan_pairs,
-        pairs_to_trace_calls,
-        write_case_llm_jsonl,
-    )
-
-    pairs = load_gateway_pairs(Path(gateway_log))
+    """Export gateway calls by execution and build HTML without harness results."""
+    from eval_harness.llm_gateway_ingest import load_gateway_pairs
+    from eval_harness.trace_store import export_executions
+    from eval_harness.trace_identity import writer_lock
     out_run_dir = Path(out_run_dir)
-    cases_root = out_run_dir / "cases"
-    cases_root.mkdir(parents=True, exist_ok=True)
-
-    if case_ids is None:
-        found: list[str] = []
-        seen: set[str] = set()
-        for p in pairs:
-            cid = p.get("case_id")
-            if cid and cid not in seen:
-                seen.add(cid)
-                found.append(str(cid))
-        case_ids = found
-
-    for cid in case_ids:
-        matched = filter_pairs_by_case_id(pairs, case_id=cid)
-        case_dir = cases_root / cid
-        case_dir.mkdir(parents=True, exist_ok=True)
-        write_case_llm_jsonl(case_dir / "llm_calls.jsonl", pairs_to_trace_calls(matched, case_id=cid))
-
-    if include_orphans:
-        orphans = orphan_pairs(pairs)
-        if orphans:
-            case_dir = cases_root / "_orphan"
-            case_dir.mkdir(parents=True, exist_ok=True)
-            write_case_llm_jsonl(
-                case_dir / "llm_calls.jsonl",
-                pairs_to_trace_calls(orphans, case_id="_orphan"),
-            )
-
-    build_llm_trace_html(out_run_dir, title=f"{out_run_dir.name} · wire-only")
+    with writer_lock(out_run_dir):
+        export_executions(load_gateway_pairs(Path(gateway_log)), out_run_dir,
+                          case_ids=case_ids, run_id=run_id, execution_ids=execution_ids,
+                          include_orphans=include_orphans)
+        build_llm_trace_html(out_run_dir, title=f"{out_run_dir.name} · wire-only")
     return out_run_dir
 
 
@@ -2222,6 +2107,8 @@ if __name__ == "__main__":
     ap.add_argument("--out-run-dir", type=Path, help="Output run dir for --from-gateway-log")
     ap.add_argument("--cases", type=str, default="", help="Comma-separated case ids (default: all tagged)")
     ap.add_argument("--include-orphans", action="store_true")
+    ap.add_argument("--run-id", help="Select an explicitly tagged batch")
+    ap.add_argument("--executions", help="Comma-separated execution IDs")
     args = ap.parse_args()
     if args.from_gateway_log:
         if not args.out_run_dir:
@@ -2232,6 +2119,8 @@ if __name__ == "__main__":
             out_run_dir=args.out_run_dir,
             case_ids=case_ids,
             include_orphans=args.include_orphans,
+            run_id=args.run_id,
+            execution_ids=args.executions.split(",") if args.executions else None,
         )
         print("wire_run", out)
         print("html", out / "llm_trace.html")

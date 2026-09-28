@@ -69,6 +69,13 @@ if os.environ.get("INSURANCE_QA_DRY_RUN") == "1":
     import app.main  # noqa: F401  import check only; no app built, no files written
     print("[insurance-qa] dry-run ok: " + app.main.__file__); sys.exit(0)
 
+# The service owns request-local ContextVar isolation; extend its explicit allowlist
+# here so this checkout's batch labels reach every model call without editing it.
+from app.observability.eval_passthrough import EVAL_HEADERS
+EVAL_HEADERS.update({name.lower(): name for name in (
+    "X-Eval-Run-Id", "X-Eval-Harness", "X-Eval-Started-At",
+)})
+
 import uvicorn  # noqa: E402
 from app.main import create_app  # noqa: E402
 from app.runtime.database import runtime_db  # noqa: E402

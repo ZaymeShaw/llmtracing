@@ -4,9 +4,9 @@ from __future__ import annotations
 import concurrent.futures
 import os
 import threading
+import uuid
 
 import argparse
-import shutil
 import json
 import subprocess
 import sys
@@ -25,13 +25,14 @@ from eval_harness.parse_dataset import parse_case_spec
 from eval_harness.adapters import (
     DEFAULT_HARNESS, dispatch_run_batch, dispatch_run_case, get_adapter, resolve_harness,
 )
+from eval_harness.trace_identity import archive_case, execution_context, new_identity, write_identity
 from eval_harness.paths import PROJECT_ROOT
 from eval_harness.normalize_trace import build_trace, extract_tool_rows, write_trace
 from eval_harness.excel_export import case_row_from_trace, turn_rows_from_trace, write_results_xlsx
 from eval_harness.llm_trace_html import build_llm_trace_html, pack_run_zip
 from eval_harness.llm_gateway_ingest import (
     attach_llm_calls_to_trace,
-    filter_pairs_for_case,
+    filter_pairs_by_execution_id,
     load_gateway_pairs,
     pairs_to_excel_rows,
     pairs_to_trace_calls,
@@ -344,11 +345,9 @@ def _case_is_success(trace: Optional[dict[str, Any]]) -> bool:
     return bool(trace) and bool(trace.get("success"))
 
 
-def _wipe_case_dir(case_dir: Path) -> None:
-    """Resume policy: failed/incomplete cases are treated as never-run — delete process dir."""
-    if case_dir.exists():
-        shutil.rmtree(case_dir)
-    case_dir.mkdir(parents=True, exist_ok=True)
+def _archive_case_dir(case_dir: Path) -> None:
+    """Preserve the previous attempt before a rerun."""
+    archive_case(case_dir)
 
 
 def _cases_for_excel_rebuild(
@@ -593,6 +592,12 @@ def _secret_scan_run_dir(run_dir: Path, run_meta: dict[str, Any]) -> bool:
 
 
 def main(argv: Optional[list[str]] = None) -> int:
+    from contextlib import ExitStack
+    with ExitStack() as stack:
+        return _main(argv, stack)
+
+
+def _main(argv, stack) -> int:
     args = build_arg_parser().parse_args(argv)
     config_path = Path(args.config).resolve()
     cfg = _merge_profile(_load_mapping(config_path), config_path.parent)
@@ -644,7 +649,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     if args.resume and not args.run_id:
         raise SystemExit("--resume requires --run-id of the interrupted run")
-    run_id = args.run_id or _now_tag()
+    run_id = args.run_id or (_now_tag() + "_" + uuid.uuid4().hex[:8])
     eval_runs_dir = Path(cfg.get("eval_runs_dir", "eval_runs"))
     if not eval_runs_dir.is_absolute():
         eval_runs_dir = (project_cwd / eval_runs_dir).resolve()
@@ -670,6 +675,8 @@ def main(argv: Optional[list[str]] = None) -> int:
               and bool(result.get("html_path")) and not result.get("html_error"))
         return 0 if ok else 2
     run_dir = eval_runs_dir / run_id
+    from eval_harness.trace_identity import writer_lock
+    stack.enter_context(writer_lock(run_dir))
     preflight_meta: Optional[dict[str, Any]] = None
     if not args.rebuild_excel:
         preflight_meta = _preflight_gate(args=args, cfg=cfg, harness_name=harness_name, config_path=config_path,
@@ -815,7 +822,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             prev_err = existing.get("error")
             err_class = _classify_error(prev_err)
             print(
-                f"[case] {case.case_id} DISCARD+RE-RUN prior_fail class={err_class} err={prev_err!r}",
+                f"[case] {case.case_id} ARCHIVE+RE-RUN prior_fail class={err_class} err={prev_err!r}",
                 flush=True,
             )
             with _progress_lock:
@@ -825,17 +832,17 @@ def main(argv: Optional[list[str]] = None) -> int:
                         "ts": datetime.now(TZ).isoformat(timespec="seconds"),
                         "run_id": run_id,
                         "case_id": case.case_id,
-                        "action": "discard_failed",
+                        "action": "archive_failed",
                         "success": False,
                         "error": prev_err,
                         "error_class": err_class,
                     },
                 )
-            _wipe_case_dir(case_dir)
+            _archive_case_dir(case_dir)
             with _agg_lock:
                 n_rerun += 1
         elif args.resume and existing is None and case_dir.exists():
-            print(f"[case] {case.case_id} DISCARD incomplete dir then run", flush=True)
+            print(f"[case] {case.case_id} ARCHIVE incomplete dir then run", flush=True)
             with _progress_lock:
                 _append_progress(
                     progress_path,
@@ -843,19 +850,23 @@ def main(argv: Optional[list[str]] = None) -> int:
                         "ts": datetime.now(TZ).isoformat(timespec="seconds"),
                         "run_id": run_id,
                         "case_id": case.case_id,
-                        "action": "discard_incomplete",
+                        "action": "archive_incomplete",
                         "success": False,
                         "error": "incomplete_or_corrupt_trace",
                         "error_class": "incomplete",
                     },
                 )
-            _wipe_case_dir(case_dir)
+            _archive_case_dir(case_dir)
             with _agg_lock:
                 n_rerun += 1
             print(f"[case] {case.case_id} turns={case.n_turns} ...", flush=True)
         else:
             print(f"[case] {case.case_id} turns={case.n_turns} ...", flush=True)
 
+        if not args.resume:
+            archive_case(case_dir)
+        identity = new_identity(str(run_id), harness_name, case.case_id)
+        write_identity(case_dir, identity)
         case_t0 = datetime.now(TZ)
         # Gateway log offset at case start: only calls made after this point can belong to
         # the case, so ingest reads the tail instead of the whole (hundreds of MB) log.
@@ -893,8 +904,11 @@ def main(argv: Optional[list[str]] = None) -> int:
                 approve=cfg.get("approve", True),
                 agent_workdir_root=agent_workdir_root,
             )
-            result = dispatch_run_case(harness_name_local, **case_options)
+            case_options.update(run_id=run_id, execution_id=identity["execution_id"])
+            with execution_context(**identity):
+                result = dispatch_run_case(harness_name_local, **case_options)
             trace = build_trace(result, harness=harness_name_local)
+            trace.update(identity)
             if isinstance(trace, dict):
                 trace.setdefault("schema_version", "1.0")
                 # Case-level judging: exit 0 is not success when every insurance tool call
@@ -934,12 +948,10 @@ def main(argv: Optional[list[str]] = None) -> int:
 
                 deadline = _time.monotonic() + 30.0
                 while True:
-                    capture_end = datetime.now(TZ)
-                    pairs = filter_pairs_for_case(
+                    pairs = filter_pairs_by_execution_id(
                         load_gateway_pairs(gw_log, start_offset=gw_offset if gw_log == _gw_log_path else 0),
                         case_id=case.case_id,
-                        start=case_t0,
-                        end=capture_end,
+                        execution_id=identity["execution_id"],
                     )
                     capture_complete = bool(pairs) and all(
                         pair.get("request") is not None
@@ -960,7 +972,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                     local_llm_rows = pairs_to_excel_rows(pairs, case_id=case.case_id)
                     print(f"[case] {case.case_id} llm_calls={len(calls)} from {gw_log.name}", flush=True)
                 else:
-                    print(f"[case] {case.case_id} llm_calls=0 (gateway log empty for window)", flush=True)
+                    print(f"[case] {case.case_id} llm_calls=0 (no gateway calls for this execution)", flush=True)
             except Exception as e:
                 print(f"[case] {case.case_id} llm_calls ingest failed: {e!r}", flush=True)
             if local_llm_rows:

@@ -13,6 +13,7 @@ from callbacks.case_id import (
     detect_protocol,
     extract_case_id,
     extract_execution_id,
+    extract_trace_labels,
     proxy_request_bits,
 )
 from callbacks.attribution import load_config as load_lane_config, mark_gateway_ready, resolve as resolve_lane_attribution
@@ -110,6 +111,20 @@ def _jsonable(obj: Any, *, _depth: int = 0) -> Any:
 
 def _safe(obj: Any) -> Any:
     return _jsonable(obj)
+
+
+def _safe_client_request(body: Any) -> Any:
+    """Preserve protocol bodies without writing credentials embedded in them."""
+    sensitive = {"api_key", "apikey", "authorization", "auth_token", "access_token", "x-api-key", "password", "secret"}
+
+    def redact(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {k: "[REDACTED]" if str(k).lower() in sensitive else redact(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [redact(v) for v in value]
+        return value
+
+    return redact(_safe(body))
 
 
 def _append(record: dict) -> None:
@@ -274,11 +289,14 @@ def _attribution_snapshot(messages: Any, kwargs: dict) -> tuple[dict[str, Any], 
     - No lane config (e.g. Claude :4001) → keep case_id-only explicit tagging.
     """
     case_id, source, execution_id, protocol, warnings = _resolve_case_and_protocol(messages, kwargs)
+    headers, body, _ = proxy_request_bits(kwargs.get("litellm_params") or {})
+    labels = extract_trace_labels(headers=headers, body=body, optional_params=kwargs.get("optional_params"))
     if case_id and execution_id:
         return (
             {
                 "case_id": case_id,
                 "execution_id": execution_id,
+                **labels,
                 "case_id_source": source,
                 "attribution_status": "explicit",
             },
@@ -294,7 +312,7 @@ def _attribution_snapshot(messages: Any, kwargs: dict) -> tuple[dict[str, Any], 
     if case_id:
         # Claude / non-lane gateways: case tag alone remains explicit.
         return (
-            {"case_id": case_id, "case_id_source": source, "attribution_status": "explicit"},
+            {"case_id": case_id, **labels, "case_id_source": source, "attribution_status": "explicit"},
             protocol,
             warnings,
         )
@@ -336,6 +354,7 @@ class EvalTraceLogger(CustomLogger):
             "model": model,
             "thinking_effective": thinking_effective,
             "thinking_source": thinking_source,
+            "client_request": _safe_client_request(proxy_request_bits(kwargs.get("litellm_params") or {})[1]),
             "messages": _safe(messages),
             "optional_params": _safe(optional_params),
             "tools": _safe(

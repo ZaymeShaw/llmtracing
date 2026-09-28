@@ -1,6 +1,8 @@
 """Spawn Pi CLI (print + JSON mode + tools + MCP), capture JSONL, multi-turn session."""
 from __future__ import annotations
 
+from eval_harness.trace_identity import current_identity, trace_headers
+
 import json
 import re
 import shutil
@@ -140,6 +142,26 @@ def resolve_pi_agent_dir(
         json.dumps({"providers": {provider: block}}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
     (d / "settings.json").write_text(json.dumps(settings, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return d
+
+
+def prepare_trace_agent_dir(agent_cwd: Path, provider: str, source: Path) -> Path:
+    """Per-execution provider headers without editing shared user configuration."""
+    identity = current_identity()
+    d = agent_cwd / ".pi-tracing"
+    d.mkdir(exist_ok=True)
+    models = _load_jsonc(source / "models.json")
+    block = (models.get("providers") or {}).get(provider)
+    if not isinstance(block, dict):
+        raise PiAgentDirError(f"provider {provider!r} missing from {source / 'models.json'}")
+    block["headers"] = {**(block.get("headers") or {}), **trace_headers(),
+                        "X-Eval-Case-Id": identity["case_id"]}
+    # Keep inherited settings/extensions accessible; isolate sessions and models.
+    for p in source.iterdir():
+        if p.name not in ("models.json", "sessions") and not (d / p.name).exists():
+            (d / p.name).symlink_to(p.resolve(), target_is_directory=p.is_dir())
+    _assert_no_literal_secrets(block, f"providers.{provider}")
+    (d / "models.json").write_text(json.dumps({"providers": {provider: block}}, ensure_ascii=False))
     return d
 
 
@@ -668,8 +690,11 @@ def run_turn(
                 case_id, build_agent_env("pi"), execution_id=execution_id, thinking=thinking,
                 local_key_names=(key_env,) if key_env else None,
             )
-            if pi_agent_dir:
-                child_env["PI_CODING_AGENT_DIR"] = str(pi_agent_dir)
+            effective_agent_dir = pi_agent_dir
+            if current_identity():
+                effective_agent_dir = prepare_trace_agent_dir(project_cwd, provider, pi_agent_dir or source_pi_agent_dir())
+            if effective_agent_dir:
+                child_env["PI_CODING_AGENT_DIR"] = str(effective_agent_dir)
             finalize_agent_env(child_env)  # raises if any value equals an upstream secret
             meta["env_var_names"] = sorted(child_env)
             if case_id and not execution_id:
@@ -803,7 +828,7 @@ def run_case(
     if claude_bin:
         pi_bin = claude_bin
     case_dir.mkdir(parents=True, exist_ok=True)
-    execution_id = uuid.uuid4().hex
+    execution_id = current_identity().get("execution_id") or uuid.uuid4().hex
     # Layer-1: agent cwd = <agent_workdir_root>/pi/<execution_id>/ (outside the repo);
     # profile project_cwd is only the template for agent.md/.mcp.json.
     template_cwd = Path(project_cwd)
@@ -938,7 +963,8 @@ def _run_case_in(
     concat_streams(case_dir, len(turn_results))
     # Session file (Pi's own JSONL) -> case_dir/session_transcript.jsonl. Not fed to
     # normalize_trace (transcript_path stays None: its parser is Claude-format).
-    save_pi_session_transcript(case_dir, session_id, pi_agent_dir, project_cwd)
+    transcript_dir = project_cwd / ".pi-tracing"
+    save_pi_session_transcript(case_dir, session_id, transcript_dir if transcript_dir.is_dir() else pi_agent_dir, project_cwd)
     # Also keep raw Pi JSON as stream_pi.jsonl for debugging
     raw_pi_out = case_dir / "stream_pi.jsonl"
     with raw_pi_out.open("w", encoding="utf-8") as w:

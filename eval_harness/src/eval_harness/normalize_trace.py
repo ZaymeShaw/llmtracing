@@ -157,6 +157,10 @@ def extract_tool_rows(events: list[dict], case_id: str) -> list[dict]:
         payload = ev.get("payload") or {}
         turn = ev.get("turn") or 1
         if kind in ("tool_use", "tool_use_start") and payload.get("name"):
+            if payload.get("id") and payload["id"] in pending:
+                if payload.get("input") is not None:
+                    pending[payload["id"]]["input_preview"] = _preview(payload["input"], 500)
+                continue
             seq += 1
             tid = payload.get("id") or f"seq-{seq}"
             row = {
@@ -183,6 +187,7 @@ def build_trace(case_result: CaseRunResult, harness: str = "claude_code") -> dic
     events: list[dict] = []
     turns_out = []
     num_tool_calls = 0
+    seen_tool_ids: set[str] = set()
     thinking_present = False
     first_frame_ms = None
     first_frame_kind = None
@@ -213,7 +218,11 @@ def build_trace(case_result: CaseRunResult, harness: str = "claude_code") -> dic
         if e.get("kind") in ("thinking", "thinking_delta", "thinking_start"):
             thinking_present = True
         if e.get("kind") in ("tool_use", "tool_use_start"):
-            num_tool_calls += 1
+            tool_id = (e.get("payload") or {}).get("id")
+            if not tool_id or tool_id not in seen_tool_ids:
+                num_tool_calls += 1
+            if tool_id:
+                seen_tool_ids.add(tool_id)
 
     trace = {
         "schema_version": "1.0",

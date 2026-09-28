@@ -9,6 +9,8 @@ Does not import or modify the insurance_qa_agent repo.
 """
 from __future__ import annotations
 
+from eval_harness.trace_identity import archive_case, new_identity, write_identity, trace_headers
+
 import argparse
 import asyncio
 import concurrent.futures
@@ -308,6 +310,8 @@ def _post_live_chat(
     messages: Optional[list[dict[str, str]]] = None,
     case_id: Optional[str] = None,
     execution_id: Optional[str] = None,
+    run_id: Optional[str] = None,
+    started_at: Optional[str] = None,
 ) -> tuple[int, Any, Optional[str]]:
     """POST Insurance /v1/chat with proxy bypass. Returns (status, body, error).
 
@@ -323,7 +327,9 @@ def _post_live_chat(
         "stream": False,
         "messages": messages or [{"role": "user", "content": prompt}],
     }
-    headers: dict[str, str] = {}
+    headers: dict[str, str] = trace_headers(run_id=run_id, harness="insurance_qa_agno")
+    if started_at:
+        headers["X-Eval-Started-At"] = started_at
     if case_id:
         headers["X-Eval-Case-Id"] = case_id
     if execution_id:
@@ -422,6 +428,32 @@ def run_live_batch(
     lane_id: str = "insurance_1",
     attribution_config: Optional[Path] = None,
 ) -> dict[str, Any]:
+    """Serialize writers to a batch directory while cases still run concurrently."""
+    from eval_harness.trace_identity import writer_lock
+    run_id = run_id or f"insurance_datasetA_{_now_tag()}_{uuid.uuid4().hex[:8]}"
+    with writer_lock(Path(eval_runs_dir or DEFAULT_EVAL_RUNS_DIR) / run_id):
+        return _run_live_batch(
+            bundle_case_ids=bundle_case_ids, run_id=run_id, chat_url=chat_url,
+            user_id=user_id, bundle_path=bundle_path, eval_runs_dir=eval_runs_dir,
+            gateway_log=gateway_log, timeout_sec=timeout_sec, resume=resume,
+            lane_id=lane_id, attribution_config=attribution_config,
+        )
+
+
+def _run_live_batch(
+    *,
+    bundle_case_ids: list[str],
+    run_id: Optional[str] = None,
+    chat_url: str = DEFAULT_CHAT_URL,
+    user_id: str = DEFAULT_USER_ID,
+    bundle_path: Optional[Path] = None,
+    eval_runs_dir: Optional[Path] = None,
+    gateway_log: Optional[Path] = None,
+    timeout_sec: float = 180.0,
+    resume: bool = False,
+    lane_id: str = "insurance_1",
+    attribution_config: Optional[Path] = None,
+) -> dict[str, Any]:
     """Live Insurance QA batch: per-case chat + gateway ingest + auto llm_trace.html."""
     from eval_harness.llm_trace_html import build_llm_trace_html
     from eval_harness.attribution_lane import LaneLease, lane_config, require_gateway_ready
@@ -429,7 +461,7 @@ def run_live_batch(
     bundle_path = Path(bundle_path or DEFAULT_BUNDLE)
     eval_runs_dir = Path(eval_runs_dir or DEFAULT_EVAL_RUNS_DIR)
     gateway_log = Path(gateway_log or DEFAULT_GATEWAY_LOG)
-    run_id = run_id or f"insurance_datasetA_{_now_tag()}"
+    run_id = run_id or f"insurance_datasetA_{_now_tag()}_{uuid.uuid4().hex[:8]}"
     attribution_config = Path(attribution_config or MOCK_SYSTEM_ROOT / "llm_gateway" / "attribution_lanes.json")
     lane_directory, _ = lane_config(attribution_config, lane_id, chat_url)
     # Insurance live batch attributes via the dedicated :4002 gateway process.
@@ -595,15 +627,14 @@ def run_live_batch(
                 return
             if case_dir.exists():
                 print(f"[case] {ins_id} ARCHIVE incomplete then run", flush=True)
-                previous_id = (prev_meta or {}).get("execution_id") or f"legacy_{_now_tag()}"
-                archive = case_dir / "attempts" / previous_id
-                archive.mkdir(parents=True, exist_ok=True)
-                for old in list(case_dir.iterdir()):
-                    if old.name != "attempts":
-                        shutil.move(str(old), str(archive / old.name))
+                archive_case(case_dir)
+        if not resume:
+            archive_case(case_dir)
         case_dir.mkdir(parents=True, exist_ok=True)
         session_id = f"eval_{ins_id}_{uuid.uuid4().hex[:12]}"
-        execution_id = uuid.uuid4().hex
+        identity = new_identity(str(run_id), "insurance_qa_agno", ins_id)
+        execution_id = identity["execution_id"]
+        write_identity(case_dir, identity)
         start_offset = gateway_log.stat().st_size
         case_t0 = datetime.now(TZ)
         (case_dir / "prompt.txt").write_text(turns[0], encoding="utf-8")
@@ -641,6 +672,8 @@ def run_live_batch(
                 messages=request_messages,
                 case_id=ins_id,
                 execution_id=execution_id,
+                run_id=str(run_id),
+                started_at=identity["started_at"],
             )
             turn_t1 = datetime.now(TZ)
             answer = _answer_from_response(body) if body is not None else ""

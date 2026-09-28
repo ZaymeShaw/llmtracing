@@ -271,3 +271,21 @@ def proxy_request_bits(litellm_params: Any) -> tuple[Any, Any, Any]:
         body = psr.get("data")
     path = psr.get("url") or psr.get("path") or ""
     return headers, body, path
+
+
+def extract_trace_labels(*, headers=None, body=None, optional_params=None):
+    """Batch/harness labels are routing metadata, independent of model protocol."""
+    result = {}
+    lowered = {str(k).lower(): v for k, v in (headers or {}).items()} if isinstance(headers, dict) else {}
+    for field, header in (("run_id", "x-eval-run-id"), ("harness", "x-eval-harness"), ("started_at", "x-eval-started-at")):
+        value = lowered.get(header)
+        if not value:
+            for source in (body, optional_params):
+                if isinstance(source, dict):
+                    meta = source.get("metadata") or {}
+                    value = source.get("eval_" + field) or (meta.get("eval_" + field) if isinstance(meta, dict) else None)
+                    if value:
+                        break
+        if isinstance(value, str) and 0 < len(value) <= 256 and not any(c in value for c in "\r\n"):
+            result[field] = value
+    return result

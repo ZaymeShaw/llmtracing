@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "eval_harness" / "src"))
 
 from eval_harness import run
+from eval_harness.trace_identity import current_identity
 from eval_harness.adapters import REGISTRY, register_adapter
 from eval_harness.adapters import claude, insurance, pi
 from eval_harness.adapters.base import CaseRunResult, TurnResult
@@ -65,13 +66,16 @@ def fake_case(**kwargs):
     gateway_log = kwargs["project_cwd"].parents[1] / "llm_gateway/logs/llm_calls.jsonl"
     gateway_log.parent.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).isoformat()
+    call_id = current_identity()["execution_id"]
     records = [
-        {"event": "request", "call_id": "test-call", "case_id": kwargs["case_id"],
+        {"event": "request", "call_id": call_id, "case_id": kwargs["case_id"],
+         **current_identity(),
          "ts": stamp, "request": {"messages": [{"role": "user", "content": "Synthetic prompt"}]}},
-        {"event": "response", "call_id": "test-call", "ts": stamp,
+        {"event": "response", "call_id": call_id, "ts": stamp,
          "status_code": 200, "response": {"choices": [{"message": {"content": "Synthetic response"}}]}},
     ]
-    gateway_log.write_text("\n".join(json.dumps(r) for r in records) + "\n")
+    with gateway_log.open("a") as out:
+        out.write("\n".join(json.dumps(r) for r in records) + "\n")
     return CaseRunResult(
         case_id=kwargs["case_id"], session_id="test-session", success=True,
         exit_code=0, error=None, wall_ms=1,
@@ -97,6 +101,13 @@ def test_cli_adapters_dispatch_and_produce_reports(checkout, monkeypatch, name, 
     assert (report / "cases/A01/trace.json").is_file()
     assert (report / "results.xlsx").is_file()
     assert (report / "llm_trace.html").is_file()
+    # A repeat in the same batch archives the first execution, keeping both viewable.
+    first = json.loads((report / "cases/A01/identity.json").read_text())["execution_id"]
+    assert run.main(["--config", str(config), "--all", "--run-id", "test", "--skip-preflight"]) == 0
+    from eval_harness.llm_trace_html import build_payload
+    attempts = build_payload(report)["cases"]
+    assert len(attempts) == 2 and sum(c["latest"] for c in attempts) == 1
+    assert any(c["identity"]["execution_id"] == first and not c["latest"] for c in attempts)
 
 
 @pytest.mark.parametrize("n_ok,expected", [(1, 0), (0, 2)])

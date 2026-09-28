@@ -118,7 +118,7 @@ def main():
             "system": parsed[-1]["system"] == "SYSTEM",
             "user_input": "Q2" in json.dumps(parsed[-1]["messages"]),
             "tool_result_visible": "TOOL_RESULT" in json.dumps(parsed[-1]["messages"]),
-            "tool_name_and_arguments": parsed[0]["tool_calls"] == [{"name": "lookup", "arguments": '{"q":"Q1"}'}] if protocol != "anthropic_messages" else bool(parsed[0]["tool_calls"]),
+            "tool_name_and_arguments": parsed[0]["tool_calls"] == [{"name": "lookup", "arguments": '{"q":"Q1"}', "id": "tool-1"}] if protocol != "anthropic_messages" else bool(parsed[0]["tool_calls"]),
             "tool_call_id_preserved_in_normalized_tool": any(t.get("id") == "tool-1" or t.get("call_id") == "tool-1" for t in parsed[0]["tool_calls"]),
             "model_final": parsed[-1]["assistant"] == "MODEL_FINAL",
             "input_output_tokens": parsed[-1]["usage"].get("prompt_tokens") == 11 and parsed[-1]["usage"].get("completion_tokens") == 7,
@@ -126,8 +126,8 @@ def main():
         }
         row["raw_evidence_retained"] = "TOOL_RESULT" in json.dumps(parsed[-1]["raw_request"]) and "MODEL_FINAL" in json.dumps(parsed[-1]["raw_response"])
         assert row["call_count"] == [2, 2] and row["normalized_calls_equal"]
-        assert row["extraction"]["model_final"] and row["raw_evidence_retained"]
-        assert row["success"] == [True, None] and row["metrics"]["num_turns"] == [2, 1]
+        assert all(row["extraction"].values()) and row["raw_evidence_retained"]
+        assert row["success"] == [True, None] and row["metrics"]["num_turns"] == [2, None]
         for d in (wire_dir, full_dir):
             build_llm_trace_html(d)
             assert (d / "llm_trace.html").stat().st_size > 10000
@@ -161,7 +161,7 @@ def main():
             report["real_cases"].append(row)
             # Only synthetic inputs are persisted as HTML; actual user data stays in source.
 
-    # Rerun grouping: current exporter merges different executions of one case.
+    # Rerun grouping: distinct executions remain distinct.
     with tempfile.TemporaryDirectory(prefix="trace-attempt-audit-") as temp:
         root = Path(temp)
         records = []
@@ -175,9 +175,18 @@ def main():
         log.write_text("\n".join(json.dumps(r) for r in records))
         materialize_wire_run(gateway_log=log, out_run_dir=root / "export")
         cases = build_payload(root / "export")["cases"]
-        report["rerun_export"] = {"case_count": len(cases), "call_count": cases[0]["n_calls"],
-                                  "execution_ids": [c["execution_id"] for c in cases[0]["calls"]]}
-        assert len(cases) == 1 and cases[0]["n_calls"] == 2
+        report["rerun_export"] = {"case_count": len(cases), "call_counts": [c["n_calls"] for c in cases],
+                                  "execution_ids": sorted(c["identity"]["execution_id"] for c in cases)}
+        assert len(cases) == 2 and all(c["n_calls"] == 1 for c in cases)
+    # A shareable, synthetic-only page for checking batch/history controls.
+    from eval_harness.trace_store import export_executions
+    rows = []
+    for batch, execution, hour in (("morning", "first", 8), ("morning", "retry", 9), ("afternoon", "new", 14)):
+        for call in protocol_calls("responses"):
+            rows.append({**call, "run_id": batch, "harness": "sdk", "execution_id": execution,
+                         "started_at": f"2026-09-28T{hour:02}:00:00Z", "call_id": execution + call["call_id"]})
+    export_executions(rows, OUT / "batch_history")
+    build_llm_trace_html(OUT / "batch_history")
     (OUT / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
     print(json.dumps(report, ensure_ascii=False, indent=2))
 

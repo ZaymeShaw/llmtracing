@@ -127,6 +127,13 @@ CFG="${LITELLM_CONFIG:-$DIR/config.litellm.with_master.yaml}"
 if [[ ! -f "$CFG" ]]; then CFG="$DIR/config.yaml"; fi
 export LITELLM_CONFIG="$CFG"
 
+# Relay startup is harness-independent; config synchronization is explicitly optional.
+sync_claude_if_requested() {
+  if [[ "${LITELLM_SYNC_CLAUDE_SETTINGS:-0}" == "1" ]]; then
+    python3 "$DIR/sync_claude_settings.py"
+  fi
+}
+
 healthy=0
 if curl -fsS -m 2 "http://${LITELLM_HOST}:${LITELLM_PORT}/v1/models" \
     -H "Authorization: Bearer ${LITELLM_MASTER_KEY}" >/dev/null 2>&1; then
@@ -134,7 +141,7 @@ if curl -fsS -m 2 "http://${LITELLM_HOST}:${LITELLM_PORT}/v1/models" \
 fi
 
 if [[ "$healthy" -eq 1 && "$FORCE_RESTART" -eq 0 ]]; then
-  python3 "$DIR/sync_claude_settings.py"
+  sync_claude_if_requested
   if ! python3 - "$LLM_ATTRIBUTION_CONFIG" "$DIR/run/litellm.pid" <<'PY'
 import hashlib, json, pathlib, sys
 try:
@@ -192,7 +199,7 @@ if command -v lsof >/dev/null 2>&1; then
   fi
 fi
 
-python3 "$DIR/sync_claude_settings.py"
+sync_claude_if_requested
 : >"$DIR/logs/litellm.stdout.log"
 
 python3 "$DIR/_detach_litellm.py"
