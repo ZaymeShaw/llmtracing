@@ -2,7 +2,7 @@
 
 The configuration binds an authenticated LiteLLM key hash to a lane. A lane's
 registry is written by the evaluation runner; this callback only reads it.
-Explicit eval_case_id tags take precedence and never consult the registry.
+Both case_id and execution_id (typically X-Eval-* headers) take precedence and never consult the registry.
 """
 from __future__ import annotations
 
@@ -59,16 +59,37 @@ def load_config(path: Path | None = None) -> dict[str, Any]:
     return {"lanes": lanes, "key_to_lane": key_to_lane, "registry_dir": registry_dir}
 
 
+def gateway_ready_filename(port: int | str) -> str:
+    """One ready marker per gateway listen port (avoids :4001/:4002 overwrite)."""
+    return f"gateway_ready.port-{port}.json"
+
+
+def gateway_ready_path(directory: Path, port: int | str) -> Path:
+    return Path(directory) / gateway_ready_filename(port)
+
+
 def mark_gateway_ready() -> None:
-    """Signal that this proxy process loaded the attribution callback/config."""
+    """Signal that this proxy process loaded the attribution callback/config.
+
+    Marker is per listen port so concurrent Claude (:4001) and Insurance (:4002)
+    gateways do not overwrite each other.
+    """
     path = config_path()
     cfg = load_config(path)
     directory = cfg["registry_dir"]
     directory.mkdir(parents=True, exist_ok=True)
-    marker = directory / "gateway_ready.json"
-    marker.write_text(json.dumps({"pid": os.getpid(), "config_path": str(path),
+    port = str(os.environ.get("LITELLM_PORT", "4001")).strip() or "4001"
+    profile = (os.environ.get("LLM_GATEWAY_PROFILE") or os.environ.get("LITELLM_PROFILE") or "").strip()
+    marker = gateway_ready_path(directory, port)
+    payload = {
+        "pid": os.getpid(),
+        "port": int(port) if port.isdigit() else port,
+        "profile": profile or None,
+        "config_path": str(path),
         "config_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-        "started_at_epoch": time.time()}) + "\n", encoding="utf-8")
+        "started_at_epoch": time.time(),
+    }
+    marker.write_text(json.dumps(payload) + "\n", encoding="utf-8")
 
 
 def key_hash_from_kwargs(kwargs: dict[str, Any]) -> str | None:

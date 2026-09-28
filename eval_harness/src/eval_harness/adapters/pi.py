@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import json
+import re
+import shutil
+import uuid
 import os
 import select
 import subprocess
@@ -12,6 +15,156 @@ from typing import Any, Optional
 from .base import CaseRunResult, TurnResult, concat_streams
 
 from eval_harness.paths import PROJECT_ROOT, WORKSPACES_ROOT
+from eval_harness.agent_env import (
+    PI_PROVIDER_KEY_ENV, build_agent_env, cleanup_case_workdir, finalize_agent_env,
+    load_local_gateway_keys, prepare_case_workdir,
+)
+
+# Files copied from the profile's project_cwd (template) into the per-case sandbox:
+# agent.md (--append-system-prompt) and project .mcp.json (pi-mcp-adapter "shared-project").
+PI_SANDBOX_FILES = (".mcp.json",)
+
+# ---------------------------------------------------------------------------------------------
+# User-scope config isolation (profile adapter.pi_agent_dir), mirrors Claude's claude_config_dir:
+#   "inherit"  -> legacy: PI_CODING_AGENT_DIR from the parent env or ~/.pi/agent (user skills in
+#                ~/.agents/skills, ~/.pi/agent/extensions/*, APPEND_SYSTEM.md, AGENTS.md, packages,
+#                sessions written to ~/.pi/agent/sessions).
+#   "per_case" -> PI_CODING_AGENT_DIR=<agent cwd>/.pi-agent (removed with the sandbox) containing ONLY:
+#                  models.json   = the ONE provider block the profile uses, copied from the source
+#                                  models.json; apiKey must be an env reference ($VAR) — literal keys
+#                                  are refused, so no key material is ever written.
+#                  settings.json = {"packages": [pi-mcp-adapter local path], "retry": <source retry>}
+#                plus CLI flags --no-skills --no-prompt-templates --no-themes --no-context-files.
+#                Pi builtin tools and the insurance-tools MCP (project .mcp.json via pi-mcp-adapter)
+#                stay. Session file is copied to <case_dir>/session_transcript.jsonl.
+#   <abs path> -> fixed shared agent dir prepared the same way.
+PI_AGENT_SUBDIR = ".pi-agent"
+PI_ISOLATION_FLAGS = ("--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files")
+DEFAULT_PI_PACKAGES = ("~/.pi/agent/npm/node_modules/pi-mcp-adapter",)
+PI_SETTINGS_KEEP = ("retry",)
+_ENV_REF_RE = re.compile(r"^\$?\{?[A-Za-z_][A-Za-z0-9_]*\}?$")
+_LITERAL_SECRET_RE = re.compile(r"(sk-[A-Za-z0-9_\-]{8,}|Bearer\s+[A-Za-z0-9._\-]{8,})")
+
+
+class PiAgentDirError(RuntimeError):
+    """Per-case Pi agent dir could not be prepared safely."""
+
+
+def source_pi_agent_dir() -> Path:
+    raw = str(os.environ.get("PI_CODING_AGENT_DIR") or "").strip()
+    return Path(os.path.expanduser(raw)) if raw else Path.home() / ".pi" / "agent"
+
+
+def strip_jsonc(text: str) -> str:
+    """JSON5-lite -> JSON: drop // and /* */ comments and trailing commas (string-aware)."""
+    out: list[str] = []
+    i, n = 0, len(text)
+    in_str = False
+    while i < n:
+        c = text[i]
+        if in_str:
+            out.append(c)
+            if c == "\\" and i + 1 < n:
+                out.append(text[i + 1]); i += 2; continue
+            if c == '"':
+                in_str = False
+            i += 1; continue
+        if c == '"':
+            in_str = True; out.append(c); i += 1; continue
+        if text.startswith("//", i):
+            j = text.find("\n", i); i = n if j < 0 else j; continue
+        if text.startswith("/*", i):
+            j = text.find("*/", i + 2); i = n if j < 0 else j + 2; continue
+        out.append(c); i += 1
+    return re.sub(r",(\s*[}\]])", r"\1", "".join(out))
+
+
+def _load_jsonc(path: Path) -> dict:
+    if not path.is_file():
+        return {}
+    data = json.loads(strip_jsonc(path.read_text(encoding="utf-8", errors="replace")))
+    return data if isinstance(data, dict) else {}
+
+
+def _assert_no_literal_secrets(obj: Any, where: str) -> None:
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if str(k).lower() in ("apikey", "api_key", "key", "token", "authorization") and isinstance(v, str):
+                if not _ENV_REF_RE.match(v.strip()):
+                    raise PiAgentDirError(f"{where}.{k} is not an env reference ($VAR); refusing to copy a literal key")
+            _assert_no_literal_secrets(v, f"{where}.{k}")
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            _assert_no_literal_secrets(v, f"{where}[{i}]")
+    elif isinstance(obj, str) and _LITERAL_SECRET_RE.search(obj):
+        raise PiAgentDirError(f"{where} looks like a literal secret; refusing to copy")
+
+
+def resolve_pi_agent_dir(
+    mode: Optional[str],
+    agent_cwd: Path,
+    *,
+    provider: str,
+    packages: Optional[list[str]] = None,
+    source_dir: Optional[Path] = None,
+) -> Optional[Path]:
+    """Return the isolated agent dir (prepared), or None for legacy "inherit"."""
+    m = str(mode or "inherit").strip()
+    if m in ("", "inherit", "none", "user"):
+        return None
+    if m == "per_case":
+        d = Path(agent_cwd) / PI_AGENT_SUBDIR
+    else:
+        d = Path(os.path.expanduser(m))
+        if not d.is_absolute():
+            raise ValueError(f"pi_agent_dir must be per_case|inherit|absolute path: {mode!r}")
+    src = Path(source_dir) if source_dir else source_pi_agent_dir()
+    if d.resolve() == src.resolve():
+        raise PiAgentDirError(f"isolated pi agent dir must differ from the source dir {src}")
+    models = _load_jsonc(src / "models.json")
+    block = (models.get("providers") or {}).get(provider)
+    if not isinstance(block, dict):
+        raise PiAgentDirError(f"provider {provider!r} not found in {src / 'models.json'}")
+    _assert_no_literal_secrets(block, f"providers.{provider}")
+    settings_src = _load_jsonc(src / "settings.json")
+    pkgs: list[str] = []
+    for raw in (packages if packages is not None else list(DEFAULT_PI_PACKAGES)):
+        pth = Path(os.path.expanduser(str(raw)))
+        if not pth.exists():
+            raise PiAgentDirError(f"pi package path not found: {pth}")
+        pkgs.append(str(pth.resolve()))
+    settings = {k: settings_src[k] for k in PI_SETTINGS_KEEP if k in settings_src}
+    settings["packages"] = pkgs
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "models.json").write_text(
+        json.dumps({"providers": {provider: block}}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    (d / "settings.json").write_text(json.dumps(settings, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return d
+
+
+def _pi_session_dir_name(cwd: Path) -> str:
+    return "--" + str(cwd).strip("/").replace("/", "-") + "--"
+
+
+def save_pi_session_transcript(
+    case_dir: Path, session_id: Optional[str], agent_dir: Optional[Path], agent_cwd: Path
+) -> Optional[Path]:
+    """Copy Pi's session file (read-only on the source) to <case_dir>/session_transcript.jsonl."""
+    if not session_id:
+        return None
+    base = (agent_dir or source_pi_agent_dir()) / "sessions"
+    cands = sorted((base / _pi_session_dir_name(agent_cwd)).glob(f"*{session_id}*.jsonl"))
+    if not cands and agent_dir is not None:
+        cands = sorted(base.rglob(f"*{session_id}*.jsonl"))
+    if not cands:
+        return None
+    dest = case_dir / "session_transcript.jsonl"
+    try:
+        shutil.copyfile(cands[-1], dest)
+    except OSError:
+        return None
+    return dest
 
 DEFAULT_PI_BIN = "pi"
 DEFAULT_PROVIDER = "local-relay"
@@ -36,15 +189,40 @@ def load_dotenv_file(path: Path) -> dict[str, str]:
     return out
 
 
-def case_id_injection_env(case_id: str | None, base_env: dict[str, str] | None = None) -> dict[str, str]:
-    """Stamp PI_EVAL_CASE_ID for local-relay header $PI_EVAL_CASE_ID; load gateway .env keys."""
+def case_id_injection_env(
+    case_id: str | None,
+    base_env: dict[str, str] | None = None,
+    *,
+    execution_id: str | None = None,
+    thinking: str | bool | None = None,
+    local_key_names: Optional[tuple] = ("LITELLM_MASTER_KEY", "INSURANCE_LITELLM_MASTER_KEY"),
+) -> dict[str, str]:
+    """Stamp PI_EVAL_* for local-relay headers; load gateway .env keys.
+
+    PI_EVAL_THINKING=on when thinking is an opt-in value; models.json maps it to
+    X-Eval-Thinking. Default/off omits the env so relay keeps thinking off.
+    """
     env: dict[str, str] = dict(base_env if base_env is not None else os.environ)
-    for k, v in load_dotenv_file(DEFAULT_GATEWAY_ENV).items():
-        # Prefer explicit process env; fill missing from .env (incl. LITELLM_MASTER_KEY).
+    # Layer-1: only the LOCAL relay key(s) are filled in (never UPSTREAM_* / provider keys).
+    # ``local_key_names`` restricts to the key the chosen provider references in models.json.
+    for k, v in load_local_gateway_keys(DEFAULT_GATEWAY_ENV.parent).items():
+        if local_key_names is not None and k not in local_key_names:
+            continue
         if k not in env or not str(env.get(k) or "").strip():
             env[k] = v
     if case_id:
         env["PI_EVAL_CASE_ID"] = case_id
+        # Unique execution id per case run (caller may pass one; otherwise mint once here).
+        env["PI_EVAL_EXECUTION_ID"] = execution_id or uuid.uuid4().hex
+    # Thinking opt-in for relay (separate from Pi CLI --thinking flag).
+    optin = False
+    if thinking is True:
+        optin = True
+    elif isinstance(thinking, str) and thinking.strip().lower() not in ("", "off", "false", "0", "none"):
+        optin = True
+    # Pi models.json always references $PI_EVAL_THINKING; unset env → hard fail.
+    # Relay only treats literal "on" as opt-in; "off"/"" keep thinking default-off.
+    env["PI_EVAL_THINKING"] = "on" if optin else "off"
     return env
 
 
@@ -61,6 +239,7 @@ def build_pi_argv(
     session_id: Optional[str],
     append_system_prompt: bool,
     extra_args: Optional[list[str]] = None,
+    isolation_flags: Optional[list[str]] = None,
 ) -> list[str]:
     argv = [
         pi_bin,
@@ -78,6 +257,8 @@ def build_pi_argv(
         argv.append("--no-builtin-tools")
     if approve:
         argv.append("--approve")
+    if isolation_flags:
+        argv.extend(isolation_flags)
     if append_system_prompt and agent_md_path.is_file():
         # Pi accepts file path or text for --append-system-prompt
         argv.extend(["--append-system-prompt", str(agent_md_path)])
@@ -309,17 +490,44 @@ def pi_events_to_claude_like(raw: list[dict]) -> list[dict]:
             # turn_end may carry final assistant message — already handled via message_end usually
             continue
 
-    # Synthetic result so Claude-style completeness checks pass
+    # Synthetic result so Claude-style completeness checks pass.
+    # If Pi reported errorMessage (e.g. auth/provider failure) mark is_error.
     final_text = _extract_final_text(raw)
+    stream_err = _extract_stream_error(raw)
     out.append(
         {
             "type": "result",
             "session_id": session_id,
-            "is_error": False,
-            "result": final_text,
+            "is_error": bool(stream_err),
+            "result": (stream_err[:2000] if stream_err else final_text),
         }
     )
     return out
+
+
+
+def _extract_stream_error(raw: list[dict]) -> str | None:
+    """Return first non-empty Pi message errorMessage, if any."""
+    for ev in raw:
+        if not isinstance(ev, dict):
+            continue
+        msg = ev.get("message")
+        if isinstance(msg, dict):
+            err = msg.get("errorMessage")
+            if isinstance(err, str) and err.strip():
+                return err.strip()
+        msgs = ev.get("messages")
+        if isinstance(msgs, list):
+            for m in msgs:
+                if not isinstance(m, dict):
+                    continue
+                err = m.get("errorMessage")
+                if isinstance(err, str) and err.strip():
+                    return err.strip()
+        err = ev.get("errorMessage")
+        if isinstance(err, str) and err.strip():
+            return err.strip()
+    return None
 
 
 def _stream_has_result(events: list[dict]) -> bool:
@@ -414,6 +622,8 @@ def run_turn(
     timeout_sec: int,
     extra_args: Optional[list[str]] = None,
     case_id: Optional[str] = None,
+    execution_id: Optional[str] = None,
+    pi_agent_dir: Optional[Path] = None,
 ) -> TurnResult:
     case_dir.mkdir(parents=True, exist_ok=True)
     stream_path = case_dir / f"stream_turn{turn_index}.jsonl"
@@ -430,6 +640,7 @@ def run_turn(
         session_id=session_id,
         append_system_prompt=append_system_prompt,
         extra_args=extra_args,
+        isolation_flags=list(PI_ISOLATION_FLAGS) if pi_agent_dir else None,
     )
     meta = {
         "turn": turn_index,
@@ -439,8 +650,10 @@ def run_turn(
         "argv_flags": [a for a in argv if a != prompt and len(a) <= 200],
         "prompt_preview": prompt[:500],
         "case_id": case_id,
+        "execution_id": execution_id,
         "provider": provider,
         "model": model,
+        "pi_agent_dir": str(pi_agent_dir) if pi_agent_dir else "inherit",
     }
 
     t0 = time.time()
@@ -449,10 +662,27 @@ def run_turn(
     exit_code = -1
     try:
         with stream_path.open("w", encoding="utf-8") as out_f, open(os.devnull, "r") as devnull:
-            child_env = case_id_injection_env(case_id, os.environ.copy())
+            # Layer-1: explicit allowlist instead of os.environ.copy() (see agent_env.py).
+            key_env = PI_PROVIDER_KEY_ENV.get(provider)
+            child_env = case_id_injection_env(
+                case_id, build_agent_env("pi"), execution_id=execution_id, thinking=thinking,
+                local_key_names=(key_env,) if key_env else None,
+            )
+            if pi_agent_dir:
+                child_env["PI_CODING_AGENT_DIR"] = str(pi_agent_dir)
+            finalize_agent_env(child_env)  # raises if any value equals an upstream secret
+            meta["env_var_names"] = sorted(child_env)
+            if case_id and not execution_id:
+                execution_id = child_env.get("PI_EVAL_EXECUTION_ID")
+                meta["execution_id"] = execution_id
             meta["case_id_injection"] = {
                 "PI_EVAL_CASE_ID": bool(case_id),
+                "PI_EVAL_EXECUTION_ID": bool(str(child_env.get("PI_EVAL_EXECUTION_ID") or "").strip()),
+                "PI_EVAL_THINKING": child_env.get("PI_EVAL_THINKING"),
                 "LITELLM_MASTER_KEY_present": bool(str(child_env.get("LITELLM_MASTER_KEY") or "").strip()),
+                "INSURANCE_LITELLM_MASTER_KEY_present": bool(
+                    str(child_env.get("INSURANCE_LITELLM_MASTER_KEY") or "").strip()
+                ),
             }
             (case_dir / f"argv_turn{turn_index}.json").write_text(
                 json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -488,6 +718,10 @@ def run_turn(
     final_text = _extract_final_text(raw_pi)
     first_frame_ms, first_frame_kind = _detect_first_frame(raw_pi, t0, line_ts)
     mapped = pi_events_to_claude_like(raw_pi)
+
+    stream_err = _extract_stream_error(raw_pi)
+    if stream_err and error is None:
+        error = stream_err[:2000]
 
     # Persist both raw Pi stream (already in stream_turn) and mapped view for debugging
     (case_dir / f"stream_turn{turn_index}_mapped.jsonl").write_text(
@@ -562,18 +796,84 @@ def run_case(
     verbose: Optional[bool] = None,
     include_partial_messages: Optional[bool] = None,
     mcp_config: Optional[str] = None,
+    agent_workdir_root: Optional[str] = None,
+    pi_agent_dir: Optional[str] = None,
+    pi_packages: Optional[list[str]] = None,
 ) -> CaseRunResult:
     if claude_bin:
         pi_bin = claude_bin
     case_dir.mkdir(parents=True, exist_ok=True)
+    execution_id = uuid.uuid4().hex
+    # Layer-1: agent cwd = <agent_workdir_root>/pi/<execution_id>/ (outside the repo);
+    # profile project_cwd is only the template for agent.md/.mcp.json.
+    template_cwd = Path(project_cwd)
+    project_cwd = prepare_case_workdir(
+        harness="pi", execution_id=execution_id, template_dir=template_cwd,
+        files=dict.fromkeys([agent_md, *PI_SANDBOX_FILES]), root=agent_workdir_root,
+    )
+    workdir_root = project_cwd.parent.parent
+    try:
+        agent_dir = resolve_pi_agent_dir(pi_agent_dir, project_cwd, provider=provider, packages=pi_packages)
+    except Exception:
+        cleanup_case_workdir(project_cwd, workdir_root)
+        raise
+    (case_dir / "agent_workdir.json").write_text(
+        json.dumps(
+            {
+                "template_cwd": str(template_cwd),
+                "agent_cwd": str(project_cwd),
+                "pi_agent_dir": str(agent_dir) if agent_dir else "inherit",
+                "pi_isolation_flags": list(PI_ISOLATION_FLAGS) if agent_dir else [],
+                "files": sorted(str(p.relative_to(project_cwd)) for p in project_cwd.rglob("*") if p.is_file()),
+            },
+            ensure_ascii=False, indent=2,
+        ),
+        encoding="utf-8",
+    )
+    try:
+        return _run_case_in(
+            case_id=case_id, turns=turns, case_dir=case_dir, project_cwd=project_cwd, pi_bin=pi_bin,
+            agent_md=agent_md, provider=provider, model=model, thinking=thinking,
+            no_builtin_tools=no_builtin_tools, approve=approve,
+            append_system_prompt=append_system_prompt, timeout_sec=timeout_sec,
+            extra_args=extra_args, execution_id=execution_id, pi_agent_dir=agent_dir,
+        )
+    finally:
+        cleanup_case_workdir(project_cwd, workdir_root)
+
+
+def _run_case_in(
+    *,
+    case_id: str,
+    turns: list[str],
+    case_dir: Path,
+    project_cwd: Path,
+    pi_bin: str,
+    agent_md: str,
+    provider: str,
+    model: str,
+    thinking: str,
+    no_builtin_tools: bool,
+    approve: bool,
+    append_system_prompt: bool,
+    timeout_sec: int,
+    extra_args: Optional[list[str]],
+    execution_id: str,
+    pi_agent_dir: Optional[Path] = None,
+) -> CaseRunResult:
     (case_dir / "prompt_turns.json").write_text(
         json.dumps(
-            {"case_id": case_id, "turns": [{"index": i + 1, "prompt": t} for i, t in enumerate(turns)]},
+            {
+                "case_id": case_id,
+                "execution_id": execution_id,
+                "turns": [{"index": i + 1, "prompt": t} for i, t in enumerate(turns)],
+            },
             ensure_ascii=False,
             indent=2,
         ),
         encoding="utf-8",
     )
+    (case_dir / "execution_id.txt").write_text(execution_id + "\n", encoding="utf-8")
     session_id: Optional[str] = None
     turn_results: list[TurnResult] = []
     t0 = time.time()
@@ -611,6 +911,8 @@ def run_case(
                 timeout_sec=timeout_sec,
                 extra_args=extra_args,
                 case_id=case_id,
+                execution_id=execution_id,
+                pi_agent_dir=pi_agent_dir,
             )
             incomplete = (not _stream_has_result(tr.raw_events)) or (
                 tr.error is not None
@@ -630,9 +932,13 @@ def run_case(
             session_id = tr.session_id
         if tr.error and overall_error is None:
             overall_error = f"turn{i}: {tr.error}"
-        if tr.exit_code != 0 or not _stream_has_result(tr.raw_events):
+        # Stop on hard turn failure including stream errorMessage (exit may still be 0).
+        if tr.exit_code != 0 or tr.error or not _stream_has_result(tr.raw_events):
             break
     concat_streams(case_dir, len(turn_results))
+    # Session file (Pi's own JSONL) -> case_dir/session_transcript.jsonl. Not fed to
+    # normalize_trace (transcript_path stays None: its parser is Claude-format).
+    save_pi_session_transcript(case_dir, session_id, pi_agent_dir, project_cwd)
     # Also keep raw Pi JSON as stream_pi.jsonl for debugging
     raw_pi_out = case_dir / "stream_pi.jsonl"
     with raw_pi_out.open("w", encoding="utf-8") as w:
@@ -646,7 +952,19 @@ def run_case(
             if body and not body.endswith("\n"):
                 w.write("\n")
 
-    success = last_exit == 0 and overall_error is None and bool(turn_results)
+    # Optimize success: any turn error (incl. Pi stream errorMessage) => not success,
+    # even when the CLI process exited 0 and emitted agent_end.
+    success = (
+        last_exit == 0
+        and overall_error is None
+        and bool(turn_results)
+        and all(not t.error for t in turn_results)
+        and not any(
+            isinstance(ev, dict) and ev.get("type") == "result" and ev.get("is_error")
+            for t in turn_results
+            for ev in (t.raw_events or [])
+        )
+    )
     return CaseRunResult(
         case_id=case_id,
         session_id=session_id,

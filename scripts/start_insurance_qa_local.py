@@ -2,8 +2,10 @@
 
 Default code root is the eval worktree (branch eval/current) with eval header
 passthrough ON.  Override with INSURANCE_QA_ROOT=<repo> to start other code.
-Writes <STATE_DIR>/server-<port>.pid and server-<port>.meta.json (root, git
-commit, passthrough flag) so the harness can record what is actually running.
+Before start, runs insurance_upstream_align.py ensure (agent/eval + MCP); set
+INSURANCE_UPSTREAM_ALIGN=0 to skip. Writes <STATE_DIR>/server-<port>.pid and
+server-<port>.meta.json (root, git commit, passthrough flag) so the harness can
+record what is actually running.
 """
 import atexit, json, os, subprocess, sys
 from datetime import datetime
@@ -15,6 +17,19 @@ STATE_DIR = Path("/Users/xiaozijian/.insurance-qa-agent-real")
 root = Path(os.environ.get("INSURANCE_QA_ROOT") or DEFAULT_ROOT).expanduser().resolve()
 if not (root / "app" / "main.py").is_file():
     sys.exit(f"[insurance-qa] INSURANCE_QA_ROOT has no app/main.py: {root}")
+
+# Upstream align gate (agent/eval branch + MCP tools). Ownership on insurance side;
+# skip with INSURANCE_UPSTREAM_ALIGN=0. Prefer auto-sync on drift (see umbrella ensure).
+_ALIGN = Path("/Users/xiaozijian/WorkSpace/package/insurance_qa_agent/scripts/insurance_upstream_align.py")
+if os.environ.get("INSURANCE_UPSTREAM_ALIGN", "1").strip().lower() not in {"0", "false", "no", "off"}:
+    if not _ALIGN.is_file():
+        sys.exit(f"[insurance-qa] missing upstream align umbrella: {_ALIGN}")
+    print("[insurance-qa] upstream align ensure…", flush=True)
+    _rc = subprocess.call([sys.executable, str(_ALIGN), "ensure"])
+    if _rc != 0:
+        sys.exit(f"[insurance-qa] upstream align ensure failed (exit {_rc}); "
+                 f"fix with: python3 {_ALIGN} status")
+
 port = int(os.environ.get("INSURANCE_QA_PORT", "18063"))
 env_type = os.environ.setdefault("ENV_TYPE", "dev")
 os.environ.setdefault("IQA_EVAL_HEADER_PASSTHROUGH", "1")  # read by create_app()

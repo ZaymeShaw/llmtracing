@@ -1,0 +1,5 @@
+# Additive Claude→bailian :4002 with per-harness concurrency (does NOT replace claude_0922.yaml)
+profile_path: ../profiles/claude_bailian4002_conc.yaml
+bundle_path: ../../bundles/120_prompt_only_0922_shared.jsonl
+dataset_path: ../../data/120题-仅问句版-0922.md
+gold_dataset_path: ../../data/复杂协同与上下文问题集-120题(2).md

@@ -75,6 +75,19 @@ export UPSTREAM_MODEL="${UPSTREAM_MODEL:-deepseek-v4-flash-0731}"
 export UPSTREAM_LITELLM_MODEL="${UPSTREAM_PROTOCOL}/${UPSTREAM_MODEL}"
 export ANTHROPIC_API_KEY="$UPSTREAM_API_KEY"
 
+# Proxy bypass for Aliyun upstreams. On macOS Python/aiohttp/httpx fall back to the *system*
+# proxy (scutil: 127.0.0.1:7890) when no proxy env is set; a flaky/stopped local proxy caused
+# "Server disconnected" / "Cannot connect to host 127.0.0.1:7890" -> HTTP 500 (run
+# triple_0922shared_nothink_20260927_214436). Setting NO_PROXY makes Python ignore the system
+# proxy entirely, so only do it for *.aliyuncs.com upstreams (penguin keeps legacy behaviour).
+# Override: GATEWAY_DIRECT_UPSTREAM=0 (keep proxy) / =1 (force direct).
+_up_host="$(printf '%s' "$UPSTREAM_API_BASE" | sed -E 's#^[a-z]+://([^/:]+).*#\1#')"
+if [[ "${GATEWAY_DIRECT_UPSTREAM:-auto}" == "1" || ( "${GATEWAY_DIRECT_UPSTREAM:-auto}" == "auto" && "$_up_host" == *.aliyuncs.com ) ]]; then
+  export NO_PROXY="127.0.0.1,localhost,::1,.aliyuncs.com${NO_PROXY:+,$NO_PROXY}"
+  export no_proxy="$NO_PROXY"
+  echo "upstream $_up_host: direct (NO_PROXY set, system proxy bypassed)"
+fi
+
 export LITELLM_HOST="${LITELLM_HOST:-127.0.0.1}"
 export LITELLM_PORT="${LITELLM_PORT:-4001}"
 export LITELLM_MASTER_KEY="${LITELLM_MASTER_KEY:-}"
@@ -102,6 +115,7 @@ ACTIVE_FILE="$DIR/run/active_profile"
 PREV_PROFILE=""
 [[ -f "$ACTIVE_FILE" ]] && PREV_PROFILE="$(cat "$ACTIVE_FILE" 2>/dev/null || true)"
 NEW_PROFILE="${PROFILE:-default}"
+export LLM_GATEWAY_PROFILE="$NEW_PROFILE"
 
 # Switching profiles requires restart even if port looks healthy
 if [[ -n "$PREV_PROFILE" && "$PREV_PROFILE" != "$NEW_PROFILE" ]]; then
@@ -126,7 +140,8 @@ import hashlib, json, pathlib, sys
 try:
     cfg = pathlib.Path(sys.argv[1]).resolve()
     config = json.loads(cfg.read_text())
-    marker_path = (cfg.parent / config.get("registry_dir", "run/attribution") / "gateway_ready.json").resolve()
+    port = __import__("os").environ.get("LITELLM_PORT", "4001")
+    marker_path = (cfg.parent / config.get("registry_dir", "run/attribution") / f"gateway_ready.port-{port}.json").resolve()
     marker = json.loads(marker_path.read_text())
     pid = int(pathlib.Path(sys.argv[2]).read_text())
     assert marker["pid"] == pid

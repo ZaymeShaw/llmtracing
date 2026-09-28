@@ -1,6 +1,8 @@
 # 新增 harness
 
-统一入口为 `python -m eval_harness.run --config <run-config> --cases A01`。Runner 负责加载 Bundle、选择题目和注册表分发；Adapter 负责具体 CLI 或服务协议。
+统一入口为 `python -m eval_harness.run --config <run-config> --cases A01`。
+
+评测中转双 ID 约定见 [adapter-eval-contract.md](adapter-eval-contract.md)。Runner 负责加载 Bundle、选择题目和注册表分发；Adapter 负责具体 CLI 或服务协议。
 
 ## 新增 CLI adapter
 

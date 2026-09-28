@@ -1,7 +1,6 @@
 schema_version: "1.0"
-profile_id: claude_code_mock_system
+profile_id: claude_code_mock_system_bailian4002_conc
 harness: claude_code
-# Isolated cwd: only MCP/agent/settings — not the eval_harness tree
 project_cwd: ../../../workspaces/claude
 bin: claude
 agent_md: agent.md
@@ -9,11 +8,9 @@ mcp_config: .mcp.json
 permission_mode: bypassPermissions
 dangerously_skip_permissions: true
 timeout_sec_per_turn: 300
-# stdout idle kill (adapter also reads EVAL_IDLE_TIMEOUT_SEC, default 45)
 idle_timeout_sec_per_turn: 600
-# incomplete/idle/overall failure retries once (EVAL_TURN_MAX_ATTEMPTS, default 2)
 turn_max_attempts: 2
-concurrency: 1
+concurrency: 4
 workspace_isolation: none
 # Layer-1: agent cwd per case = <agent_workdir_root>/<harness>/<execution_id>/ (outside repo;
 # project_cwd above is only the template). Env EVAL_AGENT_WORKDIR_ROOT overrides.
@@ -22,7 +19,6 @@ session_policy:
   new_session_per_case: true
   resume_within_case: true
 output:
-  # Keep artifacts outside workspaces/claude so the agent cwd stays clean
   eval_runs_dir: ../../../eval_runs
   keep_raw_stream: true
 adapter:
@@ -31,8 +27,5 @@ adapter:
   include_partial_messages: true
   append_system_prompt: true
   extra_args: []
-  # per_case: CLAUDE_CONFIG_DIR=<agent cwd>/.claude-config (empty) so ~/.claude user skills,
-  # plugins, settings.json, CLAUDE.md are not loaded; bundled skills + built-in tools stay.
-  # inherit: legacy behaviour (runs before 2026-09-28 used ~/.claude).
   claude_config_dir: per_case
-notes: "v1 profile. project_cwd=workspaces/claude isolates Claude from eval_harness/eval_runs. Auth in workspaces/claude/.claude; MCP venv via absolute path in .mcp.json."
+notes: "Additive 2026-09-26: Claude→:4002 bailian + concurrency=4. Default claude.yaml untouched."

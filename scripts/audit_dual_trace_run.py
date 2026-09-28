@@ -144,15 +144,29 @@ def main() -> int:
                         errors.append(f"{case_id}/{call_id}: Claude source is not header")
                     if call.get("attribution_status") != "explicit":
                         errors.append(f"{case_id}/{call_id}: Claude attribution is not explicit")
-                    if call.get("lane_id") is not None or call.get("execution_id") is not None:
-                        errors.append(f"{case_id}/{call_id}: Claude contains Insurance lane data")
+                    # Dual-id (P0): Claude mints execution_id and sends X-Eval-Execution-Id.
+                    # Only lane_id indicates Insurance lane contamination.
+                    if call.get("lane_id") is not None:
+                        errors.append(f"{case_id}/{call_id}: Claude contains Insurance lane_id")
+                    if not call.get("execution_id"):
+                        errors.append(f"{case_id}/{call_id}: Claude missing execution_id (dual-id)")
                 else:
-                    if call.get("case_id_source") != "lane_registry":
-                        errors.append(f"{case_id}/{call_id}: Insurance source is not lane_registry")
-                    if call.get("attribution_status") != "attributed":
-                        errors.append(f"{case_id}/{call_id}: Insurance call is not attributed")
-                    if call.get("lane_id") != "insurance_1":
-                        errors.append(f"{case_id}/{call_id}: wrong lane_id={call.get('lane_id')}")
+                    src = call.get("case_id_source")
+                    status = call.get("attribution_status")
+                    if src == "lane_registry":
+                        if status != "attributed":
+                            errors.append(f"{case_id}/{call_id}: Insurance call is not attributed")
+                        if call.get("lane_id") != "insurance_1":
+                            errors.append(f"{case_id}/{call_id}: wrong lane_id={call.get('lane_id')}")
+                    elif src == "header" and status == "explicit":
+                        # Concurrent header path: both X-Eval-* forwarded through Insurance.
+                        if call.get("lane_id") is not None:
+                            errors.append(f"{case_id}/{call_id}: explicit Insurance call has lane_id")
+                    else:
+                        errors.append(
+                            f"{case_id}/{call_id}: Insurance source/status "
+                            f"unsupported ({src!r}/{status!r})"
+                        )
                     if call.get("execution_id") != execution_id:
                         errors.append(f"{case_id}/{call_id}: execution_id mismatch")
                     user_texts: list[str] = []

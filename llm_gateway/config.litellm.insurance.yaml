@@ -1,0 +1,37 @@
+# Insurance + Pi Bailian relay (:4002) — separate from Claude :4001 config.
+# Thinking-at-relay: deployment default enable_thinking=false; caller override wins
+# (LiteLLM merges caller kwargs over deployment). Use model alias *-think or
+# X-Eval-Thinking: on (see callbacks/trace_callback.py async_pre_call_hook).
+# Do NOT confuse with Insurance upstream models_common_args enable_thinking:false.
+model_list:
+  - model_name: os.environ/UPSTREAM_MODEL
+    litellm_params:
+      model: os.environ/UPSTREAM_LITELLM_MODEL
+      api_base: os.environ/UPSTREAM_API_BASE
+      api_key: os.environ/UPSTREAM_API_KEY
+      drop_params: true
+      extra_body:
+        enable_thinking: false
+  - model_name: deepseek-v4-flash-0731-think
+    litellm_params:
+      model: os.environ/UPSTREAM_LITELLM_MODEL
+      api_base: os.environ/UPSTREAM_API_BASE
+      api_key: os.environ/UPSTREAM_API_KEY
+      drop_params: true
+      extra_body:
+        enable_thinking: true
+  - model_name: "*"
+    litellm_params:
+      model: os.environ/UPSTREAM_LITELLM_MODEL
+      api_base: os.environ/UPSTREAM_API_BASE
+      api_key: os.environ/UPSTREAM_API_KEY
+      drop_params: true
+      extra_body:
+        enable_thinking: false
+
+litellm_settings:
+  drop_params: true
+  callbacks: custom_callbacks.proxy_handler_instance
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY

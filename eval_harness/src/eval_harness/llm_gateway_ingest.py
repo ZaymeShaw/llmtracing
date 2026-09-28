@@ -72,7 +72,7 @@ def load_gateway_pairs(log_path: Path, *, start_offset: int = 0, strict: bool = 
         slot = slot_for(cid)
         if rec.get("case_id") and not slot.get("case_id"):
             slot["case_id"] = rec.get("case_id")
-        for key in ("execution_id", "run_id", "lane_id", "attribution_status", "case_id_source"):
+        for key in ("execution_id", "run_id", "lane_id", "attribution_status", "case_id_source", "thinking_effective", "thinking_source"):
             if rec.get(key) is not None and slot.get(key) is None:
                 slot[key] = rec[key]
         ev = rec.get("event")
@@ -267,7 +267,7 @@ def filter_pairs_by_case_id(pairs: list[dict[str, Any]], *, case_id: str) -> lis
 def filter_pairs_by_execution_id(
     pairs: list[dict[str, Any]], *, execution_id: str, case_id: str
 ) -> list[dict[str, Any]]:
-    """New Insurance runs use only the gateway's request-time lane snapshot."""
+    """Match gateway pairs by execution_id + case_id (lane or header-sourced)."""
     out = []
     for pair in pairs:
         if pair.get("execution_id") != execution_id:
@@ -298,6 +298,8 @@ def pairs_to_trace_calls(pairs: list[dict[str, Any]], *, case_id: str) -> list[d
                 "lane_id": p.get("lane_id"),
                 "attribution_status": p.get("attribution_status"),
                 "case_id_source": p.get("case_id_source"),
+                "thinking_effective": p.get("thinking_effective"),
+                "thinking_source": p.get("thinking_source"),
                 "ts": p.get("ts"),
                 "path": p.get("path"),
                 "protocol": p.get("protocol"),
@@ -339,7 +341,32 @@ def pairs_to_excel_rows(pairs: list[dict[str, Any]], *, case_id: str) -> list[di
     return rows
 
 
+def case_llm_calls_path(case_dir: Path) -> Path | None:
+    """Prefer plain llm_calls.jsonl; fall back to llm_calls.jsonl.gz after post-run slim."""
+    plain = Path(case_dir) / "llm_calls.jsonl"
+    if plain.is_file():
+        return plain
+    gz = Path(case_dir) / "llm_calls.jsonl.gz"
+    if gz.is_file():
+        return gz
+    return None
+
+
+def read_case_llm_jsonl_text(case_dir: Path) -> str | None:
+    """Read per-case llm_calls.jsonl or llm_calls.jsonl.gz as UTF-8 text."""
+    path = case_llm_calls_path(case_dir)
+    if path is None:
+        return None
+    if path.name.endswith(".gz"):
+        import gzip
+
+        with gzip.open(path, "rt", encoding="utf-8") as f:
+            return f.read()
+    return path.read_text(encoding="utf-8")
+
+
 def write_case_llm_jsonl(path: Path, calls: list[dict[str, Any]]) -> None:
+
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix=".llm-calls-", dir=path.parent)
     try:

@@ -25,6 +25,8 @@
 
 ## 2. `eval_case_id` 怎么打（三种协议通用）
 
+双 ID（`case_id` + `execution_id`）完整约定见 [adapter-eval-contract.md](adapter-eval-contract.md)。
+
 优先级（中转侧）：
 
 1. Header：`X-Eval-Case-Id: A01`

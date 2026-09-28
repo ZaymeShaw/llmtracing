@@ -215,8 +215,15 @@ def _preview(text: str, n: int = 80) -> str:
 
 
 def _load_calls(case_dir: Path) -> list[dict[str, Any]]:
-    path = case_dir / "llm_calls.jsonl"
-    if not path.is_file():
+    try:
+        from eval_harness.llm_gateway_ingest import read_case_llm_jsonl_text
+        text = read_case_llm_jsonl_text(case_dir)
+    except Exception:
+        text = None
+        plain = case_dir / "llm_calls.jsonl"
+        if plain.is_file():
+            text = plain.read_text(encoding="utf-8")
+    if text is None:
         legacy_trace = case_dir / "trace.json"
         if legacy_trace.is_file():
             try:
@@ -227,7 +234,7 @@ def _load_calls(case_dir: Path) -> list[dict[str, Any]]:
                 pass
         return []
     rows = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in text.splitlines():
         line = line.strip()
         if not line:
             continue
@@ -2128,16 +2135,22 @@ def pack_run_zip(run_dir: Path, *, out_zip: Optional[Path] = None) -> Path:
         "console.log",
         "share_manifest.json",
     )
-    with zipfile.ZipFile(tmp_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for name in top_files:
-            p = run_dir / name
+    members: list = []
+    for name in top_files:
+        p = run_dir / name
+        if p.is_file():
+            members.append((p, name))
+    cases = run_dir / "cases"
+    if cases.is_dir():
+        for p in cases.rglob("*"):
             if p.is_file():
-                zf.write(p, arcname=name)
-        cases = run_dir / "cases"
-        if cases.is_dir():
-            for p in cases.rglob("*"):
-                if p.is_file():
-                    zf.write(p, arcname=str(p.relative_to(run_dir)))
+                members.append((p, str(p.relative_to(run_dir))))
+    # Secret-scan gate: every file going into the zip; raises SecretScanError (no zip written).
+    from eval_harness.secret_scan import gate as _secret_gate
+    _secret_gate([m[0] for m in members], what=f"share zip {out_zip.name}")
+    with zipfile.ZipFile(tmp_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for p, arc in members:
+            zf.write(p, arcname=arc)
 
     if out_zip.exists():
         prev = run_dir / f"{run_dir.name}_share.prev.zip"

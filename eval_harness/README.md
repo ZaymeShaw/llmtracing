@@ -43,4 +43,4 @@ python3 -m eval_harness.import_bundle --md /path/to/questions.md --out eval_harn
 
 `python3 -m eval_harness.suite --help` 查看现有 Claude/Insurance/Pi 对比运行的参数。`scripts/run_dual_dataset_a.sh` 和 `scripts/run_triple_0922.sh` 保留已有实验预设；原 `eval_harness.dual_run` 命令兼容转发。
 
-添加新框架的接口与配置示例见 [新增 harness](../docs/adding_harness.md)。
+添加新框架的接口与配置示例见 [新增 harness](../docs/adding_harness.md)。评测中转双 ID（case_id + execution_id）约定见 [adapter-eval-contract](../docs/adapter-eval-contract.md)。

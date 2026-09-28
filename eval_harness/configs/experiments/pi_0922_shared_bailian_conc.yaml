@@ -1,0 +1,5 @@
+# Additive Pi bailian :4002 + concurrency (does NOT replace pi_0922_shared_bailian.yaml)
+profile_path: ../profiles/pi_bailian_conc.yaml
+bundle_path: ../../bundles/120_prompt_only_0922_shared_pi.jsonl
+dataset_path: ../../data/120题-仅问句版-0922.md
+gold_dataset_path: ../../data/复杂协同与上下文问题集-120题(2).md

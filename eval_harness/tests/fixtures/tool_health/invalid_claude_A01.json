@@ -1,0 +1,57 @@
+{
+ "case_id": "A01",
+ "harness": "claude_code",
+ "success": true,
+ "error": null,
+ "events": [
+  {
+   "t_ms": null,
+   "turn": 1,
+   "role": "assistant",
+   "kind": "tool_use",
+   "payload": {
+    "id": "toolu_fb60aefdc65241b59b853143",
+    "name": "mcp__insurance-tools__customer_search",
+    "input": {
+     "query": "伏云平名下的客户信息"
+    }
+   }
+  },
+  {
+   "t_ms": null,
+   "turn": 1,
+   "role": "tool",
+   "kind": "tool_result",
+   "payload": {
+    "tool_use_id": "toolu_fb60aefdc65241b59b853143",
+    "content": "PydanticUserError: `HarnessConf` is not fully defined; you should define `Literal`, then call `HarnessConf.model_rebuild()`.\n\nFor further information visit https://errors.pydantic.dev/2.13/u/class-not-fully-defined",
+    "is_error": true
+   }
+  },
+  {
+   "t_ms": null,
+   "turn": 1,
+   "role": "assistant",
+   "kind": "tool_use",
+   "payload": {
+    "id": "toolu_f70cb408a919425b86c565f6",
+    "name": "mcp__insurance-tools__customer_search",
+    "input": {
+     "query": "客户姓名伏云平"
+    }
+   }
+  },
+  {
+   "t_ms": null,
+   "turn": 1,
+   "role": "tool",
+   "kind": "tool_result",
+   "payload": {
+    "tool_use_id": "toolu_f70cb408a919425b86c565f6",
+    "content": "PydanticUserError: `HarnessConf` is not fully defined; you should define `Literal`, then call `HarnessConf.model_rebuild()`.\n\nFor further information visit https://errors.pydantic.dev/2.13/u/class-not-fully-defined",
+    "is_error": true
+   }
+  }
+ ],
+ "_fixture": "minimized from invalid run triple_0922shared_nothink_20260927_183119 (itools PydanticUserError), deleted 2026-09-27"
+}

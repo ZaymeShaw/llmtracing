@@ -1,6 +1,10 @@
 """CLI entry: batch-run Dataset Bundle cases through a harness adapter; write Trace + Excel."""
 from __future__ import annotations
 
+import concurrent.futures
+import os
+import threading
+
 import argparse
 import shutil
 import json
@@ -34,6 +38,13 @@ from eval_harness.llm_gateway_ingest import (
     write_case_llm_jsonl,
 )
 from eval_harness.simple_yaml import load_simple_yaml
+from eval_harness.tool_health import (
+    ERROR_CLASS as TOOL_INFRA_ERROR_CLASS,
+    UpstreamMonitor,
+    apply_tool_health,
+    format_upstream_errors,
+    summarize_traces,
+)
 
 TZ = ZoneInfo("Asia/Shanghai")
 CURRENT_CASE_ID_FILE = PROJECT_ROOT / "llm_gateway" / "run" / "current_case_id"
@@ -46,6 +57,46 @@ def _set_current_case_id(case_id: str | None) -> None:
     elif CURRENT_CASE_ID_FILE.exists():
         CURRENT_CASE_ID_FILE.unlink()
 
+
+
+
+def _case_submit_delay(index: int) -> float:
+    """Seconds to sleep before submitting case index (>0) into the pool."""
+    import random as _random
+    stagger = 0.0
+    raw = (os.environ.get("EVAL_CASE_STAGGER_SEC") or "").strip()
+    if raw:
+        try:
+            stagger = max(0.0, float(raw))
+        except ValueError:
+            stagger = 0.0
+    jitter = 0.0
+    raw_j = (os.environ.get("EVAL_CASE_JITTER_SEC") or "").strip()
+    if raw_j:
+        try:
+            jitter = max(0.0, float(raw_j))
+        except ValueError:
+            jitter = 0.0
+    if index <= 0:
+        return 0.0
+    delay = stagger
+    if jitter > 0:
+        delay += _random.uniform(0.0, jitter)
+    return delay
+
+
+def _resolve_concurrency(cfg: dict) -> int:
+    """Profile ``concurrency``, overridable by EVAL_CONCURRENCY (this-run only)."""
+    raw = (os.environ.get("EVAL_CONCURRENCY") or "").strip()
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            pass
+    try:
+        return max(1, int(cfg.get("concurrency") or 1))
+    except (TypeError, ValueError):
+        return 1
 
 
 def _now_tag() -> str:
@@ -100,6 +151,7 @@ def _merge_profile(cfg: dict[str, Any], harness_root: Path) -> dict[str, Any]:
         "timeout_sec_per_turn": profile.get("timeout_sec_per_turn"),
         "concurrency": profile.get("concurrency"),
         "workspace_isolation": profile.get("workspace_isolation"),
+        "agent_workdir_root": profile.get("agent_workdir_root"),
         "session_policy": profile.get("session_policy"),
         "notes": profile.get("notes"),
         "profile_id": profile.get("profile_id"),
@@ -152,6 +204,44 @@ def _resolve_bundle_path(cfg: dict[str, Any], harness_root: Path) -> Path:
     return path
 
 
+
+def _layer1_meta(
+    harness_name: str, agent_workdir_root: Optional[str], claude_config_dir: Optional[str] = None,
+    pi_agent_dir: Optional[str] = None,
+) -> dict[str, Any]:
+    """Record Layer-1 isolation in run_meta (sandbox root + env allowlist actually used)."""
+    if not agent_workdir_root:
+        return {"agent_workdir_root": None, "env_allowlist": False,
+                "note": "batch/HTTP adapter: no local agent process"}
+    from eval_harness import agent_env as _ae
+    kind = "claude" if "claude" in str(harness_name) else ("pi" if "pi" in str(harness_name) else str(harness_name))
+    names = list(_ae.BASE_ALLOW) + list(_ae.CLAUDE_ALLOW if kind == "claude" else _ae.PI_ALLOW if kind == "pi" else ())
+    meta = {
+        "agent_workdir_root": agent_workdir_root,
+        "per_case_cwd": "<agent_workdir_root>/<harness>/<execution_id>",
+        "env_allowlist": True,
+        "env_builder": "eval_harness.agent_env.build_agent_env",
+        "env_allowlist_harness": kind,
+        "env_allowlist_names": names,
+        "env_allowlist_prefixes": list(getattr(_ae, "BASE_ALLOW_PREFIXES", ())),
+    }
+    if kind == "claude":
+        mode = str(claude_config_dir or "inherit")
+        meta["claude_config_dir"] = (
+            "<per_case_cwd>/.claude-config (user skills/plugins/settings not loaded)"
+            if mode == "per_case" else mode
+        )
+    if kind == "pi":
+        mode = str(pi_agent_dir or "inherit")
+        meta["pi_agent_dir"] = (
+            "<per_case_cwd>/.pi-agent (only provider models.json + pi-mcp-adapter; "
+            "--no-skills --no-prompt-templates --no-themes --no-context-files; "
+            "user skills/extensions/APPEND_SYSTEM/AGENTS.md not loaded)"
+            if mode == "per_case" else mode
+        )
+    return meta
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Eval harness runner (Bundle + Profile -> Trace)")
     p.add_argument("--config", required=True, help="Path to configs/runs/claude.yaml")
@@ -176,6 +266,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="After excel/html build, write <run-id>_share.zip (xlsx+html+cases) for sharing",
     )
     p.add_argument(
+        "--skip-preflight",
+        action="store_true",
+        help="TESTS ONLY: skip the mandatory preflight health check (recorded in run_meta.preflight)",
+    )
+    p.add_argument(
+        "--rejudge",
+        action="store_true",
+        help="With --rebuild-excel: re-apply case-level tool-health judging to each trace.json "
+             "(writes changed traces, progress rows, results.xlsx, llm_trace.html)",
+    )
+    p.add_argument(
         "--eval-runs-dir",
         type=str,
         default=None,
@@ -189,6 +290,8 @@ def _classify_error(err: Optional[str]) -> str:
     if not err:
         return "none"
     e = err.lower()
+    if TOOL_INFRA_ERROR_CLASS in e:
+        return TOOL_INFRA_ERROR_CLASS
     if "arrearage" in e or "overdue" in e or "欠费" in err:
         return "arrearage"
     if "idle timeout" in e:
@@ -198,6 +301,26 @@ def _classify_error(err: Optional[str]) -> str:
     if "timeout" in e:
         return "timeout"
     return "other"
+
+
+def _upstream_meta(selected: list, cases_root: Path) -> dict[str, Any]:
+    """Per-side backend/upstream exposure for run_meta (tool_health.summarize_traces)."""
+    traces = []
+    for case in selected:
+        tr = _load_trace(cases_root / case.case_id)
+        if tr:
+            traces.append(tr)
+    return summarize_traces(traces)
+
+
+def _upstream_progress_fields(trace: dict[str, Any]) -> dict[str, Any]:
+    st = trace.get("upstream_status")
+    if not st:
+        return {}
+    errs = trace.get("upstream_errors") or {}
+    return {"upstream_status": st, "upstream_errors": errs,
+            "upstream_error_count": sum(int(v) for v in errs.values()),
+            "upstream_codes": format_upstream_errors(errs)}
 
 
 def _append_progress(path: Path, row: dict[str, Any]) -> None:
@@ -255,11 +378,15 @@ def _cases_for_excel_rebuild(
 
 def _llm_rows_from_case_file(case_dir: Path, case_id: str) -> list[dict[str, Any]]:
     """Rebuild llm Excel rows from per-case llm_calls.jsonl (process artifact)."""
-    p = case_dir / "llm_calls.jsonl"
-    if not p.is_file():
+    try:
+        from eval_harness.llm_gateway_ingest import read_case_llm_jsonl_text
+        text = read_case_llm_jsonl_text(case_dir)
+    except Exception:
+        text = None
+    if text is None:
         return []
     rows: list[dict[str, Any]] = []
-    for line in p.read_text(encoding="utf-8").splitlines():
+    for line in text.splitlines():
         line = line.strip()
         if not line:
             continue
@@ -313,6 +440,90 @@ def _rows_from_existing_case(
     return case_row, turn_rows, tool_rows, llm_rows
 
 
+def _rejudge_cases(
+    *,
+    selected: list,
+    cases_root: Path,
+    run_meta: dict[str, Any],
+    progress_path: Optional[Path],
+) -> None:
+    """Re-apply tool-health judging to existing traces (formal pipeline; no agent rerun)."""
+    changed: list[str] = []
+    flagged = 0
+    for case in selected:
+        tp = cases_root / case.case_id / "trace.json"
+        trace = _load_trace(tp.parent)
+        if not trace:
+            continue
+        before = (trace.get("success"), trace.get("error"), trace.get("error_class"), trace.get("tool_health"))
+        apply_tool_health(trace)
+        if (trace.get("tool_health") or {}).get("flagged"):
+            flagged += 1
+        after = (trace.get("success"), trace.get("error"), trace.get("error_class"), trace.get("tool_health"))
+        if after != before:
+            write_trace(trace, tp)
+            changed.append(case.case_id)
+            if progress_path is not None and (before[0] != after[0] or before[3] != after[3]):
+                _append_progress(progress_path, {
+                    "ts": datetime.now(TZ).isoformat(timespec="seconds"),
+                    "run_id": run_meta.get("run_id"),
+                    "case_id": case.case_id,
+                    "action": "rejudge",
+                    "success": bool(trace.get("success")),
+                    "error": trace.get("error"),
+                    "error_class": trace.get("error_class") or _classify_error(trace.get("error")),
+                    "tool_health": trace.get("tool_health"),
+                    **_upstream_progress_fields(trace),
+                })
+    run_meta["rejudge"] = {"applied": True, "traces_changed": len(changed),
+                           "flagged_tool_infra_error": flagged, "at": datetime.now(TZ).isoformat(timespec="seconds")}
+    run_meta["upstream"] = _upstream_meta(selected, cases_root)
+    print(f"[rejudge] traces_changed={len(changed)} flagged_{TOOL_INFRA_ERROR_CLASS}={flagged}", flush=True)
+
+
+def _preflight_gate(
+    *,
+    args: argparse.Namespace,
+    cfg: dict[str, Any],
+    harness_name: str,
+    config_path: Path,
+    project_cwd: Path,
+    eval_runs_dir: Path,
+    run_dir: Path,
+    include_insurance: bool = False,
+) -> dict[str, Any]:
+    """Mandatory health check before any case launches; exits 4 on failure."""
+    from eval_harness import preflight as pf
+
+    if args.skip_preflight:
+        print("[preflight] SKIPPED via --skip-preflight (tests only) — recorded in run_meta.preflight", flush=True)
+        return pf.skipped_record("--skip-preflight")
+    kind = pf.kind_of(harness_name)
+    reused = pf.load_reusable(kind)
+    if reused is not None:
+        print(f"[preflight] reuse passing parent preflight {reused['reused_from']} at={reused['at']}", flush=True)
+        return reused
+    spec_cfg = dict(cfg)
+    spec_cfg["project_cwd"] = str(project_cwd)
+    spec = pf.spec_from_cfg(spec_cfg, harness_name, str(config_path))
+    specs = [spec] if kind in ("claude", "pi") else []
+    res = pf.run_preflight(specs, eval_runs_dir=eval_runs_dir,
+                           include_insurance=include_insurance or kind == "insurance")
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "preflight.json").write_text(json.dumps(res, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    if not res["ok"]:
+        meta_path = run_dir / "run_meta.json"
+        if not meta_path.exists():
+            meta_path.write_text(json.dumps({
+                "schema_version": "1.0", "run_id": run_dir.name, "mode": "preflight_failed",
+                "harness": cfg.get("harness", DEFAULT_HARNESS), "profile_id": cfg.get("profile_id"),
+                "preflight": res,
+            }, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(pf.fail_message(res), flush=True)
+        raise SystemExit(pf.EXIT_PREFLIGHT_FAILED)
+    return res
+
+
 def _rebuild_excel_from_cases(
     *,
     selected: list,
@@ -320,7 +531,11 @@ def _rebuild_excel_from_cases(
     run_dir: Path,
     xlsx_path: Path,
     run_meta: dict[str, Any],
+    rejudge: bool = False,
+    progress_path: Optional[Path] = None,
 ) -> tuple[int, int]:
+    if rejudge:
+        _rejudge_cases(selected=selected, cases_root=cases_root, run_meta=run_meta, progress_path=progress_path)
     case_rows: list[dict[str, Any]] = []
     turn_rows: list[dict[str, Any]] = []
     tool_rows: list[dict[str, Any]] = []
@@ -337,6 +552,7 @@ def _rebuild_excel_from_cases(
         turn_rows.extend(tr)
         tool_rows.extend(tool)
         llm_rows.extend(llm)
+    run_meta["upstream"] = _upstream_meta(selected, cases_root)
     write_results_xlsx(
         xlsx_path,
         case_rows=case_rows,
@@ -357,6 +573,25 @@ def _rebuild_excel_from_cases(
     return n_ok, len(case_rows)
 
 
+def _secret_scan_run_dir(run_dir: Path, run_meta: dict[str, Any]) -> bool:
+    """Scan run_dir (html/xlsx/json/jsonl/cases). On findings: loud failure, masked report in
+    run_dir/secret_scan.json, run_meta.secret_scan=FAILED; HTML is NOT final and is NOT patched."""
+    from eval_harness.secret_scan import scan
+
+    rep = scan([run_dir])
+    d = rep.to_dict()
+    (run_dir / "secret_scan.json").write_text(json.dumps(d, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    run_meta["secret_scan"] = "PASS" if rep.ok else "FAILED"
+    (run_dir / "run_meta.json").write_text(json.dumps(run_meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    if rep.ok:
+        print(f"[secret-scan] {rep.summary_text().splitlines()[0]}", flush=True)
+        return True
+    bar = "!" * 78
+    print(f"{bar}\n[secret-scan] RUN OUTPUT CONTAINS SECRETS — llm_trace.html is NOT final, do not share\n"
+          f"{rep.summary_text()}\n{bar}", flush=True)
+    return False
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     args = build_arg_parser().parse_args(argv)
     config_path = Path(args.config).resolve()
@@ -372,6 +607,16 @@ def main(argv: Optional[list[str]] = None) -> int:
     project_cwd = _resolve(config_path.parent, str(cfg.get("project_cwd") or PROJECT_ROOT))
     if project_cwd.exists():
         project_cwd = project_cwd.resolve()
+    # Layer-1: CLI agents run in <agent_workdir_root>/<harness>/<execution_id>/ (default
+    # ~/eval_sandbox; env EVAL_AGENT_WORKDIR_ROOT overrides config agent_workdir_root).
+    # project_cwd above is only the template (agent.md/.mcp.json/.claude) + eval_runs base.
+    agent_workdir_root: Optional[str] = None
+    if get_adapter(harness_name).run_case is not None:
+        from eval_harness.agent_env import AgentWorkdirError, resolve_agent_workdir_root
+        try:
+            agent_workdir_root = str(resolve_agent_workdir_root(cfg.get("agent_workdir_root")))
+        except AgentWorkdirError as e:
+            raise SystemExit(f"[run] unsafe agent_workdir_root: {e}")
 
     bundle_path = _resolve_bundle_path(cfg, harness_root)
     bundle_cases = load_bundle(bundle_path)
@@ -407,6 +652,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     if get_adapter(harness_name).run_batch is not None:
         if args.rebuild_excel or args.pack_zip:
             raise SystemExit(f"--rebuild-excel/--pack-zip are unavailable for batch adapter {harness_name}")
+        _preflight_gate(args=args, cfg=cfg, harness_name=harness_name, config_path=config_path,
+                        project_cwd=project_cwd, eval_runs_dir=eval_runs_dir,
+                        run_dir=eval_runs_dir / run_id, include_insurance=True)
         batch_options = dict(cfg.get("_adapter_options") or {})
         batch_options.update(
             bundle_case_ids=[c.case_id for c in selected],
@@ -422,6 +670,12 @@ def main(argv: Optional[list[str]] = None) -> int:
               and bool(result.get("html_path")) and not result.get("html_error"))
         return 0 if ok else 2
     run_dir = eval_runs_dir / run_id
+    preflight_meta: Optional[dict[str, Any]] = None
+    if not args.rebuild_excel:
+        preflight_meta = _preflight_gate(args=args, cfg=cfg, harness_name=harness_name, config_path=config_path,
+                                         project_cwd=project_cwd, eval_runs_dir=eval_runs_dir, run_dir=run_dir)
+    elif args.skip_preflight:
+        print("[preflight] --skip-preflight ignored for --rebuild-excel (no case execution)", flush=True)
     cases_root = run_dir / "cases"
     cases_root.mkdir(parents=True, exist_ok=True)
 
@@ -432,6 +686,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     print(f"[run] id={run_id} cases={','.join(c.case_id for c in selected)} cwd={project_cwd}")
     print(f"[run] bin={harness_bin} version={version} harness={harness_name} bundle={bundle_path}")
     print(f"[run] profile={cfg.get('profile_id') or cfg.get('_profile_path')}")
+    print(f"[run] agent_workdir_root={agent_workdir_root} (per case: <root>/<harness>/<execution_id>)")
     if args.resume:
         print("[run] resume=1 (skip success=true traces; re-run others)")
     if args.rebuild_excel:
@@ -462,6 +717,15 @@ def main(argv: Optional[list[str]] = None) -> int:
             "timezone": "Asia/Shanghai",
             "mode": "rebuild_excel",
         }
+        prev_meta_path = run_dir / "run_meta.json"
+        if prev_meta_path.is_file():
+            try:
+                _prev = json.loads(prev_meta_path.read_text(encoding="utf-8"))
+                for _k in ("preflight", "layer1"):
+                    if _k in _prev:
+                        run_meta[_k] = _prev[_k]
+            except Exception:
+                pass
         excel_cases = _cases_for_excel_rebuild(selected, bundle_cases, cases_root)
         run_meta["n_cases"] = len(excel_cases)
         n_ok, n_total = _rebuild_excel_from_cases(
@@ -470,9 +734,12 @@ def main(argv: Optional[list[str]] = None) -> int:
             run_dir=run_dir,
             xlsx_path=xlsx_path,
             run_meta=run_meta,
+            rejudge=bool(args.rejudge),
+            progress_path=progress_path,
         )
         run_meta["n_cases"] = n_total
         run_meta["n_ok"] = n_ok
+        run_meta["upstream"] = _upstream_meta(excel_cases, cases_root)
         (run_dir / "run_meta.json").write_text(json.dumps(run_meta, ensure_ascii=False, indent=2), encoding="utf-8")
         _append_progress(
             progress_path,
@@ -505,30 +772,44 @@ def main(argv: Optional[list[str]] = None) -> int:
     n_skipped = 0
     n_rerun = 0
 
-    for case in selected:
+    concurrency = _resolve_concurrency(cfg)
+    print(f"[run] concurrency={concurrency}", flush=True)
+    _progress_lock = threading.Lock()
+    _agg_lock = threading.Lock()
+
+    def _progress_writer(row: dict[str, Any]) -> None:
+        with _progress_lock:
+            _append_progress(progress_path, {"run_id": run_id, **row})
+
+    upstream_monitor = UpstreamMonitor(run_dir, str(run_id), progress_writer=_progress_writer)
+
+    def _run_one_case(case) -> None:
+        nonlocal n_skipped, n_rerun
         case_dir = cases_root / case.case_id
         existing = _load_trace(case_dir) if args.resume else None
         if args.resume and _case_is_success(existing):
             cr, tr, tool, llm = _rows_from_existing_case(case, case_dir, run_dir)
-            case_rows.append(cr)
-            turn_rows.extend(tr)
-            tool_rows.extend(tool)
-            llm_rows.extend(llm)
-            n_skipped += 1
-            _append_progress(
-                progress_path,
-                {
-                    "ts": datetime.now(TZ).isoformat(timespec="seconds"),
-                    "run_id": run_id,
-                    "case_id": case.case_id,
-                    "action": "skip_success",
-                    "success": True,
-                    "error": None,
-                    "error_class": "none",
-                },
-            )
+            with _agg_lock:
+                case_rows.append(cr)
+                turn_rows.extend(tr)
+                tool_rows.extend(tool)
+                llm_rows.extend(llm)
+                n_skipped += 1
+            with _progress_lock:
+                _append_progress(
+                    progress_path,
+                    {
+                        "ts": datetime.now(TZ).isoformat(timespec="seconds"),
+                        "run_id": run_id,
+                        "case_id": case.case_id,
+                        "action": "skip_success",
+                        "success": True,
+                        "error": None,
+                        "error_class": "none",
+                    },
+                )
             print(f"[case] {case.case_id} SKIP success (resume)", flush=True)
-            continue
+            return
 
         if args.resume and existing is not None:
             prev_err = existing.get("error")
@@ -537,45 +818,57 @@ def main(argv: Optional[list[str]] = None) -> int:
                 f"[case] {case.case_id} DISCARD+RE-RUN prior_fail class={err_class} err={prev_err!r}",
                 flush=True,
             )
-            _append_progress(
-                progress_path,
-                {
-                    "ts": datetime.now(TZ).isoformat(timespec="seconds"),
-                    "run_id": run_id,
-                    "case_id": case.case_id,
-                    "action": "discard_failed",
-                    "success": False,
-                    "error": prev_err,
-                    "error_class": err_class,
-                },
-            )
+            with _progress_lock:
+                _append_progress(
+                    progress_path,
+                    {
+                        "ts": datetime.now(TZ).isoformat(timespec="seconds"),
+                        "run_id": run_id,
+                        "case_id": case.case_id,
+                        "action": "discard_failed",
+                        "success": False,
+                        "error": prev_err,
+                        "error_class": err_class,
+                    },
+                )
             _wipe_case_dir(case_dir)
-            n_rerun += 1
+            with _agg_lock:
+                n_rerun += 1
         elif args.resume and existing is None and case_dir.exists():
-            # Incomplete dir (no usable success trace) — same as never-run
             print(f"[case] {case.case_id} DISCARD incomplete dir then run", flush=True)
-            _append_progress(
-                progress_path,
-                {
-                    "ts": datetime.now(TZ).isoformat(timespec="seconds"),
-                    "run_id": run_id,
-                    "case_id": case.case_id,
-                    "action": "discard_incomplete",
-                    "success": False,
-                    "error": "incomplete_or_corrupt_trace",
-                    "error_class": "incomplete",
-                },
-            )
+            with _progress_lock:
+                _append_progress(
+                    progress_path,
+                    {
+                        "ts": datetime.now(TZ).isoformat(timespec="seconds"),
+                        "run_id": run_id,
+                        "case_id": case.case_id,
+                        "action": "discard_incomplete",
+                        "success": False,
+                        "error": "incomplete_or_corrupt_trace",
+                        "error_class": "incomplete",
+                    },
+                )
             _wipe_case_dir(case_dir)
-            n_rerun += 1
+            with _agg_lock:
+                n_rerun += 1
             print(f"[case] {case.case_id} turns={case.n_turns} ...", flush=True)
         else:
             print(f"[case] {case.case_id} turns={case.n_turns} ...", flush=True)
 
         case_t0 = datetime.now(TZ)
-        _set_current_case_id(case.case_id)
+        # Gateway log offset at case start: only calls made after this point can belong to
+        # the case, so ingest reads the tail instead of the whole (hundreds of MB) log.
+        _gw_log_path = (Path(str(cfg.get("llm_gateway_log"))).expanduser() if cfg.get("llm_gateway_log")
+                        else PROJECT_ROOT / "llm_gateway" / "logs" / "llm_calls.jsonl")
         try:
-            harness_name = resolve_harness(cfg.get("harness"))
+            gw_offset = _gw_log_path.stat().st_size if _gw_log_path.is_file() else 0
+        except OSError:
+            gw_offset = 0
+        if concurrency <= 1:
+            _set_current_case_id(case.case_id)
+        try:
+            harness_name_local = resolve_harness(cfg.get("harness"))
             case_options = dict(cfg.get("_adapter_options") or {})
             case_options.update(
                 case_id=case.case_id,
@@ -598,12 +891,15 @@ def main(argv: Optional[list[str]] = None) -> int:
                 thinking=cfg.get("thinking"),
                 no_builtin_tools=cfg.get("no_builtin_tools", False),
                 approve=cfg.get("approve", True),
+                agent_workdir_root=agent_workdir_root,
             )
-            result = dispatch_run_case(harness_name, **case_options)
-            trace = build_trace(result, harness=harness_name)
-            # Stamp schema_version for Trace v1 without breaking older consumers
+            result = dispatch_run_case(harness_name_local, **case_options)
+            trace = build_trace(result, harness=harness_name_local)
             if isinstance(trace, dict):
                 trace.setdefault("schema_version", "1.0")
+                # Case-level judging: exit 0 is not success when every insurance tool call
+                # hit an infra-class error (tool_health.py).
+                apply_tool_health(trace, harness=harness_name_local)
                 raw_stream = case_dir / "stream.jsonl"
                 if raw_stream.is_file():
                     trace.setdefault("artifacts", {})["raw_stream"] = "stream.jsonl"
@@ -612,24 +908,27 @@ def main(argv: Optional[list[str]] = None) -> int:
             with (case_dir / "events.jsonl").open("w", encoding="utf-8") as f:
                 for ev in trace.get("events") or []:
                     f.write(json.dumps(ev, ensure_ascii=False) + "\n")
-            
+
             rel = str(trace_path.relative_to(run_dir))
-            case_rows.append(
-                case_row_from_trace(
-                    trace,
-                    class_letter=case.class_letter,
-                    n_turns=case.n_turns,
-                    trace_relpath=rel,
-                )
+            cr = case_row_from_trace(
+                trace,
+                class_letter=case.class_letter,
+                n_turns=case.n_turns,
+                trace_relpath=rel,
             )
-            turn_rows.extend(turn_rows_from_trace(trace))
-            tool_rows.extend(extract_tool_rows(trace.get("events") or [], case.case_id))
+            tr = turn_rows_from_trace(trace)
+            tool = extract_tool_rows(trace.get("events") or [], case.case_id)
             case_t1 = datetime.now(TZ)
-            case_windows.append((case.case_id, case_t0, case_t1))
+            with _agg_lock:
+                case_rows.append(cr)
+                turn_rows.extend(tr)
+                tool_rows.extend(tool)
+                case_windows.append((case.case_id, case_t0, case_t1))
             gw_log = Path(str(cfg.get("llm_gateway_log") or "")).expanduser() if cfg.get("llm_gateway_log") else None
             if gw_log is None or not str(gw_log):
                 gw_log = PROJECT_ROOT / "llm_gateway" / "logs" / "llm_calls.jsonl"
             capture_complete = False
+            local_llm_rows = []
             try:
                 import time as _time
 
@@ -637,7 +936,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 while True:
                     capture_end = datetime.now(TZ)
                     pairs = filter_pairs_for_case(
-                        load_gateway_pairs(gw_log),
+                        load_gateway_pairs(gw_log, start_offset=gw_offset if gw_log == _gw_log_path else 0),
                         case_id=case.case_id,
                         start=case_t0,
                         end=capture_end,
@@ -658,35 +957,69 @@ def main(argv: Optional[list[str]] = None) -> int:
                     write_case_llm_jsonl(case_dir / "llm_calls.jsonl", calls)
                     trace = attach_llm_calls_to_trace(trace, calls, embed=False)
                     write_trace(trace, trace_path)
-                    llm_rows.extend(pairs_to_excel_rows(pairs, case_id=case.case_id))
+                    local_llm_rows = pairs_to_excel_rows(pairs, case_id=case.case_id)
                     print(f"[case] {case.case_id} llm_calls={len(calls)} from {gw_log.name}", flush=True)
                 else:
                     print(f"[case] {case.case_id} llm_calls=0 (gateway log empty for window)", flush=True)
             except Exception as e:
                 print(f"[case] {case.case_id} llm_calls ingest failed: {e!r}", flush=True)
+            if local_llm_rows:
+                with _agg_lock:
+                    llm_rows.extend(local_llm_rows)
             if result.success and not capture_complete:
                 trace["success"] = False
                 trace["error"] = "llm_trace_missing_or_incomplete"
                 write_trace(trace, trace_path)
-            effective_success = bool(result.success and capture_complete)
+            effective_success = bool(result.success and capture_complete and trace.get("success"))
+            case_error = result.error if result.error or effective_success else trace.get("error")
             status = "OK" if effective_success else f"FAIL exit={result.exit_code}"
-            print(f"[case] {case.case_id} {status} wall_ms={result.wall_ms} err={result.error!r}", flush=True)
-            _append_progress(
-                progress_path,
-                {
-                    "ts": datetime.now(TZ).isoformat(timespec="seconds"),
-                    "run_id": run_id,
-                    "case_id": case.case_id,
-                    "action": "rerun" if args.resume else "run",
-                    "success": effective_success,
-                    "exit_code": result.exit_code,
-                    "error": result.error,
-                    "error_class": _classify_error(result.error),
-                    "wall_ms": result.wall_ms,
-                },
-            )
+            print(f"[case] {case.case_id} {status} wall_ms={result.wall_ms} err={case_error!r}", flush=True)
+            with _progress_lock:
+                _append_progress(
+                    progress_path,
+                    {
+                        "ts": datetime.now(TZ).isoformat(timespec="seconds"),
+                        "run_id": run_id,
+                        "case_id": case.case_id,
+                        "action": "rerun" if args.resume else "run",
+                        "success": effective_success,
+                        "exit_code": result.exit_code,
+                        "error": case_error,
+                        "error_class": trace.get("error_class") or _classify_error(case_error),
+                        "tool_health": trace.get("tool_health"),
+                        **_upstream_progress_fields(trace),
+                        "wall_ms": result.wall_ms,
+                    },
+                )
+            if harness_name_local in ("claude_code", "pi_coding"):
+                # live exposure of backend trouble (WARN per case, rolling-window ALERT)
+                upstream_monitor.observe(case.case_id, trace)
         finally:
-            _set_current_case_id(None)
+            if concurrency <= 1:
+                _set_current_case_id(None)
+
+    if concurrency <= 1:
+        for case in selected:
+            _run_one_case(case)
+    else:
+        # Dual-id headers attribute; shared current_case_id file is skipped.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
+            import time as _stagger_time
+            futs = []
+            for _si, c in enumerate(selected):
+                _delay = _case_submit_delay(_si)
+                if _delay > 0:
+                    print(f"[run] stagger submit i={_si} sleep={_delay:.2f}s", flush=True)
+                    _stagger_time.sleep(_delay)
+                futs.append(pool.submit(_run_one_case, c))
+            errors = []
+            for fut in concurrent.futures.as_completed(futs):
+                exc = fut.exception()
+                if exc is not None:
+                    errors.append(exc)
+                    print(f"[run] worker error: {exc!r}", flush=True)
+            if errors:
+                raise errors[0]
 
     # Final Excel is always rebuilt from per-case process artifacts so resume
     # and mid-run interruption never leave a partial in-memory-only sheet.
@@ -709,6 +1042,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     run_meta["mode"] = "resume" if args.resume else "run"
     run_meta["n_skipped_success"] = n_skipped
     run_meta["n_rerun"] = n_rerun
+    run_meta["layer1"] = _layer1_meta(
+        harness_name, agent_workdir_root, cfg.get("claude_config_dir"), cfg.get("pi_agent_dir")
+    )
+    run_meta["preflight"] = preflight_meta
     (run_dir / "run_meta.json").write_text(json.dumps(run_meta, ensure_ascii=False, indent=2), encoding="utf-8")
     excel_cases = _cases_for_excel_rebuild(selected, bundle_cases, cases_root)
     run_meta["n_cases"] = len(excel_cases)
@@ -721,13 +1058,25 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     run_meta["n_cases"] = n_total
     run_meta["n_ok"] = n_ok
+    run_meta["upstream"] = _upstream_meta(excel_cases, cases_root)
     (run_dir / "run_meta.json").write_text(
         json.dumps(run_meta, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+    _u = run_meta["upstream"]
+    if _u.get("upstream_blocked") or _u.get("upstream_degraded"):
+        print(f"[upstream] SUMMARY side={run_id} upstream_blocked={_u['upstream_blocked']} "
+              f"({','.join(_u['blocked_ids'][:10])}) upstream_degraded={_u['upstream_degraded']} "
+              f"codes={format_upstream_errors(_u['upstream_errors'], 3)} (backend-side; not counted as failures)",
+              flush=True)
 
     print(f"[done] results={xlsx_path}")
     print(f"[done] run_dir={run_dir}")
     print(f"[done] success={n_ok}/{len(excel_cases)} (excel_rows={n_total} skipped={n_skipped} rerun={n_rerun} ran={len(selected)})")
+
+    # Secret-scan gate on everything this run produced (blocks; never redacts).
+    scan_ok = _secret_scan_run_dir(run_dir, run_meta)
+    if not scan_ok:
+        return 3
 
     if args.pack_zip:
         try:

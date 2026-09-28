@@ -29,14 +29,40 @@ def lane_config(path: Path, lane_id: str, chat_url: str) -> tuple[Path, dict[str
     return directory, row
 
 
-def require_gateway_ready(directory: Path, config_path: Path) -> None:
-    """A runner must not silently produce empty traces against an old proxy."""
-    marker = json.loads((directory / "gateway_ready.json").read_text(encoding="utf-8"))
+def gateway_ready_filename(port: int | str) -> str:
+    """Match llm_gateway.callbacks.attribution: one marker file per listen port."""
+    return f"gateway_ready.port-{port}.json"
+
+
+def require_gateway_ready(
+    directory: Path,
+    config_path: Path,
+    *,
+    port: int | str | None = None,
+) -> None:
+    """A runner must not silently produce empty traces against an old proxy.
+
+    Ready markers are per gateway listen port (e.g. gateway_ready.port-4002.json)
+    so Claude :4001 and Insurance :4002 do not clobber each other.
+    """
+    if port is None:
+        port = os.environ.get("LLM_ATTRIBUTION_READY_PORT") or os.environ.get("LITELLM_PORT")
+    if port is None or str(port).strip() == "":
+        raise RuntimeError("gateway ready port required (pass port= or set LLM_ATTRIBUTION_READY_PORT)")
+    port = str(port).strip()
+    marker_path = Path(directory) / gateway_ready_filename(port)
+    try:
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"gateway attribution not ready on :{port} (missing {marker_path.name})") from exc
     pid = marker.get("pid")
     if marker.get("config_path") != str(config_path.resolve()):
         raise RuntimeError("gateway uses a different attribution config")
     if marker.get("config_sha256") != hashlib.sha256(config_path.read_bytes()).hexdigest():
         raise RuntimeError("gateway attribution config changed without restart")
+    marker_port = marker.get("port")
+    if marker_port is not None and str(marker_port) != port:
+        raise RuntimeError(f"gateway ready marker port mismatch: file=:{port} body={marker_port}")
     if not isinstance(pid, int) or pid <= 0:
         raise RuntimeError("invalid gateway attribution process")
     try:
@@ -45,10 +71,8 @@ def require_gateway_ready(directory: Path, config_path: Path) -> None:
         # macOS sandbox can deny signal probes for a healthy service started
         # outside it. EPERM still proves that the PID exists.
         pass
-    # Multiple isolated local gateways can load the same attribution config.
-    # The live marker PID and exact config digest are authoritative; binding
-    # this check to the legacy single-instance PID file rejects a dedicated
-    # Insurance gateway running beside the Claude gateway.
+    except ProcessLookupError as exc:
+        raise RuntimeError(f"gateway attribution process on :{port} is not running (pid={pid})") from exc
 
 
 def _atomic_json(path: Path, row: dict[str, Any]) -> None:

@@ -1,0 +1,105 @@
+{
+ "case_id": "PI_A01",
+ "harness": "pi_coding",
+ "success": true,
+ "error": null,
+ "events": [
+  {
+   "t_ms": null,
+   "turn": 1,
+   "role": "assistant",
+   "kind": "tool_use",
+   "payload": {
+    "id": "call_861113db3da741ecb469996c",
+    "name": "insurance-tools_customer_search",
+    "input": {
+     "query": "伏云平"
+    }
+   }
+  },
+  {
+   "t_ms": null,
+   "turn": 1,
+   "role": "assistant",
+   "kind": "tool_use",
+   "payload": {
+    "id": "call_861113db3da741ecb469996c",
+    "name": "insurance-tools_customer_search",
+    "input": {
+     "query": "伏云平"
+    }
+   }
+  },
+  {
+   "t_ms": null,
+   "turn": 1,
+   "role": "tool",
+   "kind": "tool_result",
+   "payload": {
+    "tool_use_id": "call_861113db3da741ecb469996c",
+    "content": {
+     "content": [
+      {
+       "type": "text",
+       "text": "Error: PydanticUserError: `HarnessConf` is not fully defined; you should define `Literal`, then call `HarnessConf.model_rebuild()`.\n\nFor further information visit https://errors.pydantic.dev/2.13/u/class-not-fully-defined"
+      }
+     ],
+     "details": {
+      "error": "tool_error",
+      "server": "insurance-tools"
+     }
+    },
+    "is_error": true
+   }
+  },
+  {
+   "t_ms": null,
+   "turn": 1,
+   "role": "assistant",
+   "kind": "tool_use",
+   "payload": {
+    "id": "call_2e79798f891742e69fe404f3",
+    "name": "insurance-tools_customer_search",
+    "input": {
+     "query": "伏云平的客户信息"
+    }
+   }
+  },
+  {
+   "t_ms": null,
+   "turn": 1,
+   "role": "assistant",
+   "kind": "tool_use",
+   "payload": {
+    "id": "call_2e79798f891742e69fe404f3",
+    "name": "insurance-tools_customer_search",
+    "input": {
+     "query": "伏云平的客户信息"
+    }
+   }
+  },
+  {
+   "t_ms": null,
+   "turn": 1,
+   "role": "tool",
+   "kind": "tool_result",
+   "payload": {
+    "tool_use_id": "call_2e79798f891742e69fe404f3",
+    "content": {
+     "content": [
+      {
+       "type": "text",
+       "text": "Error: PydanticUserError: `HarnessConf` is not fully defined; you should define `Literal`, then call `HarnessConf.model_rebuild()`.\n\nFor further information visit https://errors.pydantic.dev/2.13/u/class-not-fully-defined"
+      }
+     ],
+     "details": {
+      "error": "tool_error",
+      "server": "insurance-tools"
+     }
+    },
+    "is_error": true
+   }
+  }
+ ],
+ "_fixture": "minimized from invalid run triple_0922shared_nothink_20260927_183119 (itools PydanticUserError), deleted 2026-09-27"
+}

@@ -90,7 +90,7 @@ def test_cli_adapters_dispatch_and_produce_reports(checkout, monkeypatch, name, 
 
     monkeypatch.setattr(module, "run_case", invoke)
     config = checkout / "eval_harness/configs/runs" / f"{name}.yaml"
-    assert run.main(["--config", str(config), "--all", "--run-id", "test"]) == 0
+    assert run.main(["--config", str(config), "--all", "--run-id", "test", "--skip-preflight"]) == 0
     assert calls[0][bin_key] == name
     assert calls[0]["project_cwd"] == checkout / "workspaces" / name
     report = checkout / "eval_runs/test"
@@ -109,7 +109,7 @@ def test_insurance_uses_common_entrypoint_and_preserves_batch_options(checkout, 
 
     monkeypatch.setattr(insurance, "run_live_batch", batch)
     config = checkout / "eval_harness/configs/runs/insurance.yaml"
-    assert run.main(["--config", str(config), "--cases", "A01", "--run-id", "test", "--resume"]) == expected
+    assert run.main(["--config", str(config), "--cases", "A01", "--run-id", "test", "--resume", "--skip-preflight"]) == expected
     assert calls[0]["bundle_case_ids"] == ["A01"]
     assert calls[0]["resume"] is True
     assert calls[0]["eval_runs_dir"] == checkout / "eval_runs"
@@ -132,7 +132,7 @@ def test_new_adapter_receives_custom_options_without_runner_changes(checkout, mo
     config = checkout / "eval_harness/configs/runs/synthetic.yaml"
     config.write_text("profile_path: ../profiles/synthetic.yaml\nbundle_path: ../../bundles/120_prompt_only_v1.jsonl\n")
     try:
-        assert run.main(["--config", str(config), "--all", "--run-id", "custom"]) == 0
+        assert run.main(["--config", str(config), "--all", "--run-id", "custom", "--skip-preflight"]) == 0
         assert calls[0]["custom_setting"] == "passed-through"
         assert calls[0]["harness_bin"] == "synthetic-cli"
         with pytest.raises(ValueError, match="already registered"):

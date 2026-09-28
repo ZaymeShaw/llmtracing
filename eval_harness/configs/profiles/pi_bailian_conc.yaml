@@ -1,7 +1,6 @@
 schema_version: "1.0"
-profile_id: pi_coding_local_relay
+profile_id: pi_coding_local_relay_bailian_conc
 harness: pi_coding
-# Isolated cwd: Pi project .mcp.json (ITOOLS_AGENT_ID=pi) + agent.md — not workspaces/claude
 project_cwd: ../../../workspaces/pi
 bin: pi
 agent_md: agent.md
@@ -9,7 +8,7 @@ mcp_config: .mcp.json
 timeout_sec_per_turn: 300
 idle_timeout_sec_per_turn: 600
 turn_max_attempts: 2
-concurrency: 1
+concurrency: 4
 workspace_isolation: none
 # Layer-1: agent cwd per case = <agent_workdir_root>/<harness>/<execution_id>/ (outside repo;
 # project_cwd above is only the template). Env EVAL_AGENT_WORKDIR_ROOT overrides.
@@ -24,14 +23,10 @@ adapter:
   output_format: json
   verbose: true
   append_system_prompt: true
-  # Pi local-relay knobs (read by adapters.registry._pi_run_case)
-  provider: local-relay
-  model: deepseek-v4-flash
+  provider: local-relay-bailian
+  model: deepseek-v4-flash-0731
   thinking: "off"
-  no_builtin_tools: false  # 2026-09-25: full Pi builtin tools (read/grep/...) so truncated MCP output spill files are readable
+  no_builtin_tools: false
   approve: true
   extra_args: []
-notes: >
-  Phase B Pi profile. Uses workspaces/pi/.mcp.json (insurance-tools, ITOOLS_AGENT_ID=pi,
-  directTools:true). Auth via LITELLM_MASTER_KEY + PI_EVAL_CASE_ID→X-Eval-Case-Id
-  on local-relay. Does not modify Claude workspaces/claude/.mcp.json.
+notes: "Additive 2026-09-26: Pi bailian :4002 + concurrency=4. thinking=off."

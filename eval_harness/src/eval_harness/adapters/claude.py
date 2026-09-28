@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import re
+import uuid
 import os
 import select
 import subprocess
@@ -11,29 +13,82 @@ from typing import Any, Optional
 
 
 from .base import CaseRunResult, TurnResult, concat_streams, redact_obj
+from eval_harness.agent_env import (
+    build_agent_env, cleanup_case_workdir, finalize_agent_env, prepare_case_workdir,
+)
+
+# Files copied from the profile's project_cwd (template) into the per-case sandbox.
+# Claude reads project settings (.claude/settings.local.json: local relay URL/token, model,
+# CLAUDE_CODE_ATTRIBUTION_HEADER, enabledMcpjsonServers) and .mcp.json relative to cwd.
+CLAUDE_SANDBOX_FILES = (".claude/settings.local.json", ".mcp.json")
+
+# User-scope config isolation (profile adapter.claude_config_dir):
+#   "per_case" -> CLAUDE_CONFIG_DIR=<agent cwd>/.claude-config (empty, removed with the sandbox):
+#                user skills (~/.claude/skills), plugins, user settings.json, CLAUDE.md, history
+#                are NOT loaded; Claude Code's bundled skills/built-in tools stay. Project
+#                settings (<cwd>/.claude/settings.local.json: relay URL/token) still apply.
+#   "inherit"  -> legacy: whatever the parent env / ~/.claude provides.
+#   <abs path> -> fixed shared config dir.
+CLAUDE_CONFIG_SUBDIR = ".claude-config"
+
+
+def resolve_claude_config_dir(mode: Optional[str], agent_cwd: Path) -> Optional[Path]:
+    m = str(mode or "inherit").strip()
+    if m in ("", "inherit", "none", "user"):
+        return None
+    if m == "per_case":
+        d = Path(agent_cwd) / CLAUDE_CONFIG_SUBDIR
+    else:
+        d = Path(os.path.expanduser(m))
+        if not d.is_absolute():
+            raise ValueError(f"claude_config_dir must be per_case|inherit|absolute path: {mode!r}")
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 
 CASE_ID_HEADER = "X-Eval-Case-Id"
+EXECUTION_ID_HEADER = "X-Eval-Execution-Id"
 
 
-def case_id_injection_env(case_id: str | None, base_env: dict[str, str] | None = None) -> dict[str, str]:
-    """Phase 2/3: Claude Code header + EXTRA_BODY injection (shared relay_inject)."""
+def case_id_injection_env(
+    case_id: str | None,
+    base_env: dict[str, str] | None = None,
+    *,
+    execution_id: str | None = None,
+    thinking: bool | None = None,
+) -> dict[str, str]:
+    """Stamp X-Eval-Case-Id / X-Eval-Execution-Id / optional X-Eval-Thinking.
+
+    Mirrors Pi: when case_id is set, mint a unique execution_id unless the caller
+    passes one. Also sets EVAL_EXECUTION_ID in the child env for meta recovery
+    (wire delivery is still the Anthropic custom header).
+    thinking=True → X-Eval-Thinking: on (relay opt-in); default/None → omit
+    (relay forces thinking off).
+    """
     from eval_harness.relay_inject import anthropic_cli_env
 
     if not case_id:
         return dict(base_env if base_env is not None else os.environ)
-    return anthropic_cli_env(case_id, base_env)
+    eid = execution_id or uuid.uuid4().hex
+    env = anthropic_cli_env(case_id, base_env, execution_id=eid, thinking=thinking)
+    env["EVAL_EXECUTION_ID"] = eid
+    return env
 
 
 def encode_project_dir(cwd: str) -> str:
-    return os.path.abspath(cwd).replace("/", "-")
+    # Claude Code maps every non-alphanumeric char ("/", "_", ".") to "-"
+    # (e.g. ~/eval_sandbox/... -> -Users-x-eval-sandbox-...).
+    return re.sub(r"[^A-Za-z0-9]", "-", os.path.abspath(cwd))
 
 
-def find_session_transcript(cwd: str, session_id: str) -> Optional[Path]:
+def find_session_transcript(
+    cwd: str, session_id: str, config_dir: Optional[Path] = None
+) -> Optional[Path]:
     if not session_id:
         return None
     encoded = encode_project_dir(cwd)
-    root = Path.home() / ".claude" / "projects" / encoded
+    base = Path(config_dir) if config_dir else Path.home() / ".claude"
+    root = base / "projects" / encoded
     candidates = [
         root / f"{session_id}.jsonl",
         root / "sessions" / f"{session_id}.jsonl",
@@ -297,6 +352,9 @@ def run_turn(
     timeout_sec: int,
     extra_args: Optional[list[str]] = None,
     case_id: Optional[str] = None,
+    execution_id: Optional[str] = None,
+    thinking: bool | None = None,
+    claude_config_dir: Optional[Path] = None,
 ) -> TurnResult:
     case_dir.mkdir(parents=True, exist_ok=True)
     stream_path = case_dir / f"stream_turn{turn_index}.jsonl"
@@ -323,6 +381,8 @@ def run_turn(
         "argv_flags": [a for a in argv if a != prompt and len(a) <= 200],
         "prompt_preview": prompt[:500],
         "case_id": case_id,
+        "execution_id": execution_id,
+        "claude_config_dir": str(claude_config_dir) if claude_config_dir else "inherit",
     }
 
     t0 = time.time()
@@ -331,12 +391,28 @@ def run_turn(
     exit_code = -1
     try:
         with stream_path.open("w", encoding="utf-8") as out_f, open(os.devnull, "r") as devnull:
-            child_env = case_id_injection_env(case_id, os.environ.copy())
+            # Layer-1: explicit allowlist instead of os.environ.copy() (see agent_env.py).
+            base_env = build_agent_env("claude")
+            if claude_config_dir:
+                base_env["CLAUDE_CONFIG_DIR"] = str(claude_config_dir)
+            child_env = case_id_injection_env(
+                case_id, base_env, execution_id=execution_id, thinking=thinking,
+            )
+            finalize_agent_env(child_env)  # raises if any value equals an upstream secret
+            meta["env_var_names"] = sorted(child_env)
+            if case_id and not execution_id:
+                execution_id = child_env.get("EVAL_EXECUTION_ID")
+                meta["execution_id"] = execution_id
             meta["case_id"] = case_id
+            hdrs = child_env.get("ANTHROPIC_CUSTOM_HEADERS", "")
             meta["case_id_injection"] = {
                 "header": bool(case_id),
+                "execution_header": bool(
+                    case_id and EXECUTION_ID_HEADER.lower() + ":" in hdrs.lower()
+                ),
                 "extra_body": bool(case_id),
                 "text_marker": bool(case_id and agent_md_path.is_file()),
+                "EVAL_EXECUTION_ID": bool(str(child_env.get("EVAL_EXECUTION_ID") or "").strip()),
             }
             (case_dir / f"argv_turn{turn_index}.json").write_text(
                 json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -428,16 +504,88 @@ def run_case(
     mcp_config: Optional[str],
     timeout_sec: int,
     extra_args: Optional[list[str]] = None,
+    thinking: str | bool | None = None,
+    agent_workdir_root: Optional[str] = None,
+    claude_config_dir: Optional[str] = None,
 ) -> CaseRunResult:
     case_dir.mkdir(parents=True, exist_ok=True)
+    execution_id = uuid.uuid4().hex
+    # Layer-1: agent cwd = <agent_workdir_root>/claude/<execution_id>/ (outside the repo);
+    # profile project_cwd is only the template for agent.md/.mcp.json/.claude settings.
+    template_cwd = Path(project_cwd)
+    sandbox_files = [agent_md, *CLAUDE_SANDBOX_FILES]
+    if mcp_config and not os.path.isabs(mcp_config):
+        sandbox_files.append(mcp_config)
+    project_cwd = prepare_case_workdir(
+        harness="claude", execution_id=execution_id, template_dir=template_cwd,
+        files=dict.fromkeys(sandbox_files), root=agent_workdir_root,
+    )
+    workdir_root = project_cwd.parent.parent
+    cfg_dir = resolve_claude_config_dir(claude_config_dir, project_cwd)
+    (case_dir / "agent_workdir.json").write_text(
+        json.dumps(
+            {
+                "template_cwd": str(template_cwd),
+                "agent_cwd": str(project_cwd),
+                "claude_config_dir": str(cfg_dir) if cfg_dir else "inherit",
+                "files": sorted(str(p.relative_to(project_cwd)) for p in project_cwd.rglob("*") if p.is_file()),
+            },
+            ensure_ascii=False, indent=2,
+        ),
+        encoding="utf-8",
+    )
+    try:
+        return _run_case_in(
+            case_id=case_id, turns=turns, case_dir=case_dir, project_cwd=project_cwd,
+            claude_bin=claude_bin, agent_md=agent_md, permission_mode=permission_mode,
+            dangerously_skip_permissions=dangerously_skip_permissions, output_format=output_format,
+            verbose=verbose, include_partial_messages=include_partial_messages, mcp_config=mcp_config,
+            timeout_sec=timeout_sec, extra_args=extra_args, thinking=thinking, execution_id=execution_id,
+            claude_config_dir=cfg_dir,
+        )
+    finally:
+        cleanup_case_workdir(project_cwd, workdir_root)
+
+
+def _run_case_in(
+    *,
+    case_id: str,
+    turns: list[str],
+    case_dir: Path,
+    project_cwd: Path,
+    claude_bin: str,
+    agent_md: str,
+    permission_mode: str,
+    dangerously_skip_permissions: bool,
+    output_format: str,
+    verbose: bool,
+    include_partial_messages: bool,
+    mcp_config: Optional[str],
+    timeout_sec: int,
+    extra_args: Optional[list[str]],
+    thinking: str | bool | None,
+    execution_id: str,
+    claude_config_dir: Optional[Path] = None,
+) -> CaseRunResult:
+    # Relay thinking opt-in: only "on"/True set the header; default/off omit (relay OFF).
+    thinking_optin: bool | None = None
+    if thinking is True or (isinstance(thinking, str) and thinking.strip().lower() in ("on", "true", "1", "adaptive", "enabled")):
+        thinking_optin = True
+    elif isinstance(thinking, str) and thinking.strip().isdigit() and int(thinking.strip()) > 0:
+        thinking_optin = True
     (case_dir / "prompt_turns.json").write_text(
         json.dumps(
-            {"case_id": case_id, "turns": [{"index": i + 1, "prompt": t} for i, t in enumerate(turns)]},
+            {
+                "case_id": case_id,
+                "execution_id": execution_id,
+                "turns": [{"index": i + 1, "prompt": t} for i, t in enumerate(turns)],
+            },
             ensure_ascii=False,
             indent=2,
         ),
         encoding="utf-8",
     )
+    (case_dir / "execution_id.txt").write_text(execution_id + "\n", encoding="utf-8")
     session_id: Optional[str] = None
     turn_results: list[TurnResult] = []
     t0 = time.time()
@@ -474,6 +622,9 @@ def run_case(
                 timeout_sec=timeout_sec,
                 extra_args=extra_args,
                 case_id=case_id,
+                execution_id=execution_id,
+                thinking=thinking_optin,
+                claude_config_dir=claude_config_dir,
             )
             incomplete = (not _stream_has_result(tr.raw_events)) or (
                 tr.error is not None and ("idle timeout" in (tr.error or "") or "incomplete stream" in (tr.error or "") or "timeout after" in (tr.error or ""))
@@ -493,7 +644,7 @@ def run_case(
     concat_streams(case_dir, len(turn_results))
     transcript_path = None
     if session_id:
-        tp = find_session_transcript(str(project_cwd), session_id)
+        tp = find_session_transcript(str(project_cwd), session_id, claude_config_dir)
         if tp:
             dest = case_dir / "session_transcript.jsonl"
             try:

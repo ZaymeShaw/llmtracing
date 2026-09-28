@@ -118,6 +118,11 @@ def write_results_xlsx(
         "final_output",
         "trace_relpath",
         "error",
+        "error_class",
+        "tool_ok_calls",
+        "tool_infra_errors",
+        "upstream_status",
+        "upstream_errors",
     ]
     ws.append(case_cols)
     for r in case_rows:
@@ -234,6 +239,15 @@ def case_row_from_trace(trace: dict, *, class_letter: str, n_turns: int, trace_r
         "final_output": _join_turns(final_parts, label="最终回复"),
         "trace_relpath": trace_relpath,
         "error": trace.get("error"),
+        # case-level tool health (eval_harness.tool_health): tool_infra_error when every
+        # insurance tool call hit an infra-class error even though the agent exited 0
+        "error_class": trace.get("error_class") or ("none" if trace.get("success") else None),
+        "tool_ok_calls": (trace.get("tool_health") or {}).get("ok"),
+        "tool_infra_errors": (trace.get("tool_health") or {}).get("infra"),
+        # backend/upstream-side trouble: exposed, never counted as our failure
+        "upstream_status": trace.get("upstream_status") or "none",
+        "upstream_errors": "; ".join(f"{k} x{v}" for k, v in sorted(
+            (trace.get("upstream_errors") or {}).items(), key=lambda kv: -kv[1])) or None,
     }
 
 

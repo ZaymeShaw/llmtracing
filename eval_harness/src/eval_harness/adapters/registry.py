@@ -23,6 +23,9 @@ _CLAUDE_KEYS = {
     "mcp_config",
     "timeout_sec",
     "extra_args",
+    "thinking",
+    "agent_workdir_root",
+    "claude_config_dir",
 }
 
 
@@ -53,6 +56,9 @@ def _pi_run_case(**kwargs: Any) -> CaseRunResult:
         thinking=str(kwargs.get("thinking") or "off"),
         no_builtin_tools=bool(kwargs.get("no_builtin_tools", False)),
         approve=bool(kwargs.get("approve", True)),
+        agent_workdir_root=kwargs.get("agent_workdir_root"),
+        pi_agent_dir=kwargs.get("pi_agent_dir"),
+        pi_packages=kwargs.get("pi_packages"),
     )
 
 

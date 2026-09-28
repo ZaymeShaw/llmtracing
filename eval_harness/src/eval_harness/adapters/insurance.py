@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import concurrent.futures
+import threading
 import json
 import os
 import shutil
@@ -23,6 +25,7 @@ from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
 from eval_harness.relay_inject import apply_openai_compatible_case_id, openai_compatible_kwargs
+from eval_harness.llm_gateway_ingest import read_case_llm_jsonl_text
 
 TZ = ZoneInfo("Asia/Shanghai")
 
@@ -61,16 +64,13 @@ def _rebuild_live_summary(cases_root: Path) -> list[dict[str, Any]]:
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             continue
-        llm_path = case_dir / "llm_calls.jsonl"
         n_calls = 0
-        if llm_path.is_file():
-            try:
-                n_calls = sum(
-                    1 for line in llm_path.read_text(encoding="utf-8").splitlines()
-                    if line.strip()
-                )
-            except OSError:
-                n_calls = 0
+        try:
+            _llm_txt = read_case_llm_jsonl_text(case_dir)
+            if _llm_txt:
+                n_calls = sum(1 for line in _llm_txt.splitlines() if line.strip())
+        except OSError:
+            n_calls = 0
         answer = str(meta.get("answer") or "")
         rows.append(
             {
@@ -306,8 +306,14 @@ def _post_live_chat(
     prompt: str,
     timeout_sec: float,
     messages: Optional[list[dict[str, str]]] = None,
+    case_id: Optional[str] = None,
+    execution_id: Optional[str] = None,
 ) -> tuple[int, Any, Optional[str]]:
-    """POST Insurance /v1/chat with proxy bypass. Returns (status, body, error)."""
+    """POST Insurance /v1/chat with proxy bypass. Returns (status, body, error).
+
+    When case_id + execution_id are provided, stamp X-Eval-* headers so the
+    Insurance eval passthrough can forward them to LiteLLM for concurrent attribution.
+    """
     import httpx
 
     _no_proxy_env()
@@ -317,9 +323,14 @@ def _post_live_chat(
         "stream": False,
         "messages": messages or [{"role": "user", "content": prompt}],
     }
+    headers: dict[str, str] = {}
+    if case_id:
+        headers["X-Eval-Case-Id"] = case_id
+    if execution_id:
+        headers["X-Eval-Execution-Id"] = execution_id
     try:
         with httpx.Client(trust_env=False, timeout=timeout_sec) as client:
-            r = client.post(chat_url, json=payload)
+            r = client.post(chat_url, json=payload, headers=headers or None)
         try:
             body: Any = r.json()
         except Exception:
@@ -372,6 +383,31 @@ def _ingest_case_gateway(
     return len(calls), complete
 
 
+def _case_submit_delay(index: int) -> float:
+    """Seconds to sleep before submitting case index (>0) into the pool."""
+    import random as _random
+    stagger = 0.0
+    raw = (os.environ.get("EVAL_CASE_STAGGER_SEC") or "").strip()
+    if raw:
+        try:
+            stagger = max(0.0, float(raw))
+        except ValueError:
+            stagger = 0.0
+    jitter = 0.0
+    raw_j = (os.environ.get("EVAL_CASE_JITTER_SEC") or "").strip()
+    if raw_j:
+        try:
+            jitter = max(0.0, float(raw_j))
+        except ValueError:
+            jitter = 0.0
+    if index <= 0:
+        return 0.0
+    delay = stagger
+    if jitter > 0:
+        delay += _random.uniform(0.0, jitter)
+    return delay
+
+
 def run_live_batch(
     *,
     bundle_case_ids: list[str],
@@ -396,7 +432,9 @@ def run_live_batch(
     run_id = run_id or f"insurance_datasetA_{_now_tag()}"
     attribution_config = Path(attribution_config or MOCK_SYSTEM_ROOT / "llm_gateway" / "attribution_lanes.json")
     lane_directory, _ = lane_config(attribution_config, lane_id, chat_url)
-    require_gateway_ready(lane_directory, attribution_config)
+    # Insurance live batch attributes via the dedicated :4002 gateway process.
+    ready_port = os.environ.get("INSURANCE_LITELLM_PORT") or os.environ.get("LLM_ATTRIBUTION_READY_PORT") or "4002"
+    require_gateway_ready(lane_directory, attribution_config, port=ready_port)
     if not gateway_log.is_file():
         raise RuntimeError(f"gateway log unavailable: {gateway_log}")
     full_run_id = f"{eval_runs_dir.name}/{run_id}"
@@ -491,260 +529,327 @@ def run_live_batch(
         print("[live-batch] resume=1 (skip completed cases; archive incomplete attempts)", flush=True)
 
     n_skipped = 0
-    with LaneLease(lane_directory, lane_id) as lane:
-        for bundle_id, ins_id, turns in selected:
-            case_dir = cases_root / ins_id
-            if resume:
-                meta_path = case_dir / "meta.json"
-                prev_ok = False
-                prev_meta: Optional[dict[str, Any]] = None
-                if meta_path.is_file() and meta_path.stat().st_size > 20:
-                    try:
-                        prev_meta = json.loads(meta_path.read_text(encoding="utf-8"))
-                        prev_ok = (
-                            bool(prev_meta.get("success"))
-                            and prev_meta.get("attribution_status") in ("captured", "unknown_no_calls")
-                            and int(prev_meta.get("num_turns") or 0) == len(turns)
-                        )
-                    except Exception:
-                        prev_meta = None
-                        prev_ok = False
-                if prev_ok and prev_meta is not None:
-                    n_calls = 0
-                    llm_p = case_dir / "llm_calls.jsonl"
-                    if llm_p.is_file() and llm_p.stat().st_size > 0:
-                        try:
-                            n_calls = sum(1 for line in llm_p.read_text(encoding="utf-8").splitlines() if line.strip())
-                        except Exception:
-                            n_calls = 0
-                    summary_rows.append(
-                        {
-                            "case_id": ins_id,
-                            "execution_id": prev_meta.get("execution_id"),
-                            "attribution_status": prev_meta.get("attribution_status"),
-                            "bundle_case_id": bundle_id,
-                            "http_status": prev_meta.get("http_status"),
-                            "ms": prev_meta.get("wall_ms"),
-                            "ok": True,
-                            "busy": False,
-                            "llm_calls": n_calls,
-                            "answer": (prev_meta.get("answer") or "")[:500],
-                            "error": None,
-                            "skipped": True,
-                        }
+    _conc_raw = (os.environ.get("INSURANCE_LIVE_CONCURRENCY") or os.environ.get("EVAL_CONCURRENCY") or "1").strip()
+    try:
+        concurrency = max(1, int(_conc_raw))
+    except ValueError:
+        concurrency = 1
+    print(f"[live-batch] concurrency={concurrency}", flush=True)
+    _summary_lock = threading.Lock()
+
+    def _append_summary(row: dict[str, Any]) -> None:
+        with _summary_lock:
+            summary_rows.append(row)
+
+    class _NullLane:
+        def start(self, **kwargs):  # dual-id path; lane registry unused
+            return None
+        def finish(self, **kwargs):
+            return None
+
+    def _run_one_insurance_case(bundle_id: str, ins_id: str, turns: list, lane) -> None:
+        nonlocal n_skipped
+        case_dir = cases_root / ins_id
+        if resume:
+            meta_path = case_dir / "meta.json"
+            prev_ok = False
+            prev_meta: Optional[dict[str, Any]] = None
+            if meta_path.is_file() and meta_path.stat().st_size > 20:
+                try:
+                    prev_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                    prev_ok = (
+                        bool(prev_meta.get("success"))
+                        and prev_meta.get("attribution_status") in ("captured", "unknown_no_calls")
+                        and int(prev_meta.get("num_turns") or 0) == len(turns)
                     )
+                except Exception:
+                    prev_meta = None
+                    prev_ok = False
+            if prev_ok and prev_meta is not None:
+                n_calls = 0
+                try:
+                    _llm_txt = read_case_llm_jsonl_text(case_dir)
+                    if _llm_txt:
+                        n_calls = sum(1 for line in _llm_txt.splitlines() if line.strip())
+                except Exception:
+                    n_calls = 0
+                _append_summary(
+                    {
+                        "case_id": ins_id,
+                        "execution_id": prev_meta.get("execution_id"),
+                        "attribution_status": prev_meta.get("attribution_status"),
+                        "bundle_case_id": bundle_id,
+                        "http_status": prev_meta.get("http_status"),
+                        "ms": prev_meta.get("wall_ms"),
+                        "ok": True,
+                        "busy": False,
+                        "llm_calls": n_calls,
+                        "answer": (prev_meta.get("answer") or "")[:500],
+                        "error": None,
+                        "skipped": True,
+                    }
+                )
+                with _summary_lock:
                     n_skipped += 1
-                    print(f"[case] {ins_id} SKIP success (resume)", flush=True)
-                    continue
-                if case_dir.exists():
-                    print(f"[case] {ins_id} ARCHIVE incomplete then run", flush=True)
-                    previous_id = (prev_meta or {}).get("execution_id") or f"legacy_{_now_tag()}"
-                    archive = case_dir / "attempts" / previous_id
-                    archive.mkdir(parents=True, exist_ok=True)
-                    for old in list(case_dir.iterdir()):
-                        if old.name != "attempts":
-                            shutil.move(str(old), str(archive / old.name))
-            case_dir.mkdir(parents=True, exist_ok=True)
-            session_id = f"eval_{ins_id}_{uuid.uuid4().hex[:12]}"
-            execution_id = uuid.uuid4().hex
-            start_offset = gateway_log.stat().st_size
-            case_t0 = datetime.now(TZ)
-            (case_dir / "prompt.txt").write_text(turns[0], encoding="utf-8")
-            (case_dir / "prompt_turns.json").write_text(
+                print(f"[case] {ins_id} SKIP success (resume)", flush=True)
+                return
+            if case_dir.exists():
+                print(f"[case] {ins_id} ARCHIVE incomplete then run", flush=True)
+                previous_id = (prev_meta or {}).get("execution_id") or f"legacy_{_now_tag()}"
+                archive = case_dir / "attempts" / previous_id
+                archive.mkdir(parents=True, exist_ok=True)
+                for old in list(case_dir.iterdir()):
+                    if old.name != "attempts":
+                        shutil.move(str(old), str(archive / old.name))
+        case_dir.mkdir(parents=True, exist_ok=True)
+        session_id = f"eval_{ins_id}_{uuid.uuid4().hex[:12]}"
+        execution_id = uuid.uuid4().hex
+        start_offset = gateway_log.stat().st_size
+        case_t0 = datetime.now(TZ)
+        (case_dir / "prompt.txt").write_text(turns[0], encoding="utf-8")
+        (case_dir / "prompt_turns.json").write_text(
+            json.dumps(
+                {"case_id": ins_id, "turns": [
+                    {"index": index, "prompt": prompt}
+                    for index, prompt in enumerate(turns, start=1)
+                ]},
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        lane.start(run_id=full_run_id, case_id=ins_id, execution_id=execution_id)
+        print(
+            f"[case] {ins_id} (bundle={bundle_id}, turns={len(turns)}) ...",
+            flush=True,
+        )
+
+        history: list[dict[str, str]] = []
+        turn_rows: list[dict[str, Any]] = []
+        status = 0
+        body: Any = None
+        err: Optional[str] = None
+        for turn_index, prompt in enumerate(turns, start=1):
+            turn_t0 = datetime.now(TZ)
+            request_messages = [*history, {"role": "user", "content": prompt}]
+            status, body, err = _post_live_chat(
+                chat_url=chat_url,
+                user_id=user_id,
+                session_id=session_id,
+                prompt=prompt,
+                timeout_sec=timeout_sec,
+                messages=request_messages,
+                case_id=ins_id,
+                execution_id=execution_id,
+            )
+            turn_t1 = datetime.now(TZ)
+            answer = _answer_from_response(body) if body is not None else ""
+            turn_busy = _is_busy_answer(answer)
+            turn_ok = (
+                status == 200 and err is None and not turn_busy and bool(answer.strip())
+            )
+            turn_error = err or (("busy:" + answer[:80]) if turn_busy else None)
+            turn_row = {
+                "index": turn_index,
+                "prompt": prompt,
+                "answer": answer,
+                "final_text": answer,
+                "http_status": status,
+                "wall_ms": int((turn_t1 - turn_t0).total_seconds() * 1000),
+                "t0": turn_t0.isoformat(timespec="milliseconds"),
+                "t1": turn_t1.isoformat(timespec="milliseconds"),
+                "success": turn_ok,
+                "error": turn_error,
+            }
+            turn_rows.append(turn_row)
+            (case_dir / f"response_turn{turn_index}.json").write_text(
                 json.dumps(
-                    {"case_id": ins_id, "turns": [
-                        {"index": index, "prompt": prompt}
-                        for index, prompt in enumerate(turns, start=1)
-                    ]},
+                    body if body is not None else {"error": err},
                     ensure_ascii=False,
                     indent=2,
                 ),
                 encoding="utf-8",
             )
-            lane.start(run_id=full_run_id, case_id=ins_id, execution_id=execution_id)
             print(
-                f"[case] {ins_id} (bundle={bundle_id}, turns={len(turns)}) ...",
+                f"[case] {ins_id} turn={turn_index}/{len(turns)} "
+                f"{'OK' if turn_ok else 'FAIL'} http={status} "
+                f"wall_ms={turn_row['wall_ms']}",
                 flush=True,
             )
+            if not turn_ok:
+                break
+            history.extend(
+                [
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": answer},
+                ]
+            )
+        case_t1 = datetime.now(TZ)
+        wall_ms = int((case_t1 - case_t0).total_seconds() * 1000)
+        answer = turn_rows[-1]["answer"] if turn_rows else ""
+        busy = any(_is_busy_answer(str(row.get("answer") or "")) for row in turn_rows)
+        ok = len(turn_rows) == len(turns) and all(row["success"] for row in turn_rows)
+        case_error = next((row["error"] for row in turn_rows if row["error"]), None)
 
-            history: list[dict[str, str]] = []
-            turn_rows: list[dict[str, Any]] = []
-            status = 0
-            body: Any = None
-            err: Optional[str] = None
-            for turn_index, prompt in enumerate(turns, start=1):
-                turn_t0 = datetime.now(TZ)
-                request_messages = [*history, {"role": "user", "content": prompt}]
-                status, body, err = _post_live_chat(
-                    chat_url=chat_url,
-                    user_id=user_id,
-                    session_id=session_id,
-                    prompt=prompt,
-                    timeout_sec=timeout_sec,
-                    messages=request_messages,
-                )
-                turn_t1 = datetime.now(TZ)
-                answer = _answer_from_response(body) if body is not None else ""
-                turn_busy = _is_busy_answer(answer)
-                turn_ok = (
-                    status == 200 and err is None and not turn_busy and bool(answer.strip())
-                )
-                turn_error = err or (("busy:" + answer[:80]) if turn_busy else None)
-                turn_row = {
-                    "index": turn_index,
-                    "prompt": prompt,
-                    "answer": answer,
-                    "final_text": answer,
-                    "http_status": status,
-                    "wall_ms": int((turn_t1 - turn_t0).total_seconds() * 1000),
-                    "t0": turn_t0.isoformat(timespec="milliseconds"),
-                    "t1": turn_t1.isoformat(timespec="milliseconds"),
-                    "success": turn_ok,
-                    "error": turn_error,
-                }
-                turn_rows.append(turn_row)
-                (case_dir / f"response_turn{turn_index}.json").write_text(
-                    json.dumps(
-                        body if body is not None else {"error": err},
-                        ensure_ascii=False,
-                        indent=2,
-                    ),
-                    encoding="utf-8",
-                )
-                print(
-                    f"[case] {ins_id} turn={turn_index}/{len(turns)} "
-                    f"{'OK' if turn_ok else 'FAIL'} http={status} "
-                    f"wall_ms={turn_row['wall_ms']}",
-                    flush=True,
-                )
-                if not turn_ok:
-                    break
-                history.extend(
-                    [
-                        {"role": "user", "content": prompt},
-                        {"role": "assistant", "content": answer},
-                    ]
-                )
-            case_t1 = datetime.now(TZ)
-            wall_ms = int((case_t1 - case_t0).total_seconds() * 1000)
-            answer = turn_rows[-1]["answer"] if turn_rows else ""
-            busy = any(_is_busy_answer(str(row.get("answer") or "")) for row in turn_rows)
-            ok = len(turn_rows) == len(turns) and all(row["success"] for row in turn_rows)
-            case_error = next((row["error"] for row in turn_rows if row["error"]), None)
+        # Case-dir artifacts (Claude-like layout)
+        (case_dir / "response.json").write_text(
+            json.dumps(body if body is not None else {"error": err}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        (case_dir / "responses.json").write_text(
+            json.dumps(turn_rows, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        meta = {
+            "case_id": ins_id,
+            "execution_id": execution_id,
+            "lane_id": lane_id,
+            "run_id": full_run_id,
+            "bundle_case_id": bundle_id,
+            "http_status": status,
+            "wall_ms": wall_ms,
+            "t0": case_t0.isoformat(timespec="milliseconds"),
+            "t1": case_t1.isoformat(timespec="milliseconds"),
+            "user_id": user_id,
+            "session_id": session_id,
+            "chat_url": chat_url,
+            "prompt": turns[0],
+            "answer": answer,
+            "num_turns": len(turn_rows),
+            "expected_turns": len(turns),
+            "turns": turn_rows,
+            "success": ok,
+            "error": case_error,
+            "response": body if isinstance(body, dict) else {"raw": body},
+        }
+        (case_dir / "meta.json").write_text(
+            json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        # insurance_only-style sidecar next to cases/<id>/
+        sidecar = {
+            "case_id": ins_id,
+            "execution_id": execution_id,
+            "lane_id": lane_id,
+            "bundle_case_id": bundle_id,
+            "http_status": status,
+            "wall_ms": wall_ms,
+            "ms": wall_ms,
+            "t0": meta["t0"],
+            "t1": meta["t1"],
+            "user_id": user_id,
+            "session_id": session_id,
+            "success": ok,
+            "num_turns": len(turn_rows),
+            "expected_turns": len(turns),
+            "turns": turn_rows,
+            "answer": answer,
+            "error": meta["error"],
+            "response": body if isinstance(body, dict) else {"raw": body},
+        }
+        (cases_root / f"{ins_id}.json").write_text(
+            json.dumps(sidecar, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
 
-            # Case-dir artifacts (Claude-like layout)
-            (case_dir / "response.json").write_text(
-                json.dumps(body if body is not None else {"error": err}, ensure_ascii=False, indent=2),
-                encoding="utf-8",
+        n_calls = 0
+        calls_complete = False
+        ingest_error = None
+        try:
+            n_calls, calls_complete = _ingest_case_gateway(
+                case_dir=case_dir,
+                case_id=ins_id,
+                gateway_log=gateway_log,
+                execution_id=execution_id,
+                start_offset=start_offset,
             )
-            (case_dir / "responses.json").write_text(
-                json.dumps(turn_rows, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
-            meta = {
-                "case_id": ins_id,
-                "execution_id": execution_id,
-                "lane_id": lane_id,
-                "run_id": full_run_id,
-                "bundle_case_id": bundle_id,
-                "http_status": status,
-                "wall_ms": wall_ms,
-                "t0": case_t0.isoformat(timespec="milliseconds"),
-                "t1": case_t1.isoformat(timespec="milliseconds"),
-                "user_id": user_id,
-                "session_id": session_id,
-                "chat_url": chat_url,
-                "prompt": turns[0],
-                "answer": answer,
-                "num_turns": len(turn_rows),
-                "expected_turns": len(turns),
-                "turns": turn_rows,
-                "success": ok,
-                "error": case_error,
-                "response": body if isinstance(body, dict) else {"raw": body},
-            }
-            (case_dir / "meta.json").write_text(
-                json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
-            # insurance_only-style sidecar next to cases/<id>/
-            sidecar = {
-                "case_id": ins_id,
-                "execution_id": execution_id,
-                "lane_id": lane_id,
-                "bundle_case_id": bundle_id,
-                "http_status": status,
-                "wall_ms": wall_ms,
-                "ms": wall_ms,
-                "t0": meta["t0"],
-                "t1": meta["t1"],
-                "user_id": user_id,
-                "session_id": session_id,
-                "success": ok,
-                "num_turns": len(turn_rows),
-                "expected_turns": len(turns),
-                "turns": turn_rows,
-                "answer": answer,
-                "error": meta["error"],
-                "response": body if isinstance(body, dict) else {"raw": body},
-            }
-            (cases_root / f"{ins_id}.json").write_text(
-                json.dumps(sidecar, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
-
-            n_calls = 0
-            calls_complete = False
-            ingest_error = None
-            try:
-                n_calls, calls_complete = _ingest_case_gateway(
-                    case_dir=case_dir,
-                    case_id=ins_id,
-                    gateway_log=gateway_log,
-                    execution_id=execution_id,
-                    start_offset=start_offset,
-                )
-                print(f"[case] {ins_id} llm_calls={n_calls} from {gateway_log.name}", flush=True)
-            except Exception as e:
-                ingest_error = f"{type(e).__name__}: {e}"
-                print(f"[case] {ins_id} llm_calls ingest failed: {e!r}", flush=True)
-            transport_failed = any(
-                row.get("error") and not str(row.get("error")).startswith("busy:")
-                for row in turn_rows
-            ) or any(row.get("http_status") == 0 for row in turn_rows)
-            blocked = bool(transport_failed or ingest_error or not calls_complete)
-            meta["attribution_status"] = (
-                "capture_error" if ingest_error else "incomplete_calls" if not calls_complete
-                else "unknown_no_calls" if n_calls == 0 else "captured"
-            )
-            (case_dir / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
-            sidecar["attribution_status"] = meta["attribution_status"]
-            (cases_root / f"{ins_id}.json").write_text(
-                json.dumps(sidecar, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
-            lane.finish(blocked=blocked, reason=err or ingest_error or ("incomplete_calls" if blocked else None))
-            if blocked:
-                raise RuntimeError(f"lane {lane_id} blocked after {ins_id}: {err or ingest_error or 'incomplete_calls'}")
-
-            preview = (answer or "")[:120].replace("\n", " ")
-            status_s = "OK" if ok else "FAIL"
-            print(
-                f"[case] {ins_id} {status_s} http={status} wall_ms={wall_ms} busy={busy} "
-                f"err={err!r} answer={preview!r}",
-                flush=True,
-            )
-            summary_rows.append(
+            print(f"[case] {ins_id} llm_calls={n_calls} from {gateway_log.name}", flush=True)
+        except Exception as e:
+            ingest_error = f"{type(e).__name__}: {e}"
+            print(f"[case] {ins_id} llm_calls ingest failed: {e!r}", flush=True)
+        transport_failed = any(
+            row.get("error") and not str(row.get("error")).startswith("busy:")
+            for row in turn_rows
+        ) or any(row.get("http_status") == 0 for row in turn_rows)
+        blocked = bool(transport_failed or ingest_error or not calls_complete)
+        meta["attribution_status"] = (
+            "capture_error" if ingest_error else "incomplete_calls" if not calls_complete
+            else "unknown_no_calls" if n_calls == 0 else "captured"
+        )
+        (case_dir / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+        sidecar["attribution_status"] = meta["attribution_status"]
+        (cases_root / f"{ins_id}.json").write_text(
+            json.dumps(sidecar, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        lane.finish(blocked=blocked, reason=err or ingest_error or ("incomplete_calls" if blocked else None))
+        if blocked:
+            msg = f"lane {lane_id} blocked after {ins_id}: {err or ingest_error or 'incomplete_calls'}"
+            # Continue batch on timeout/block for all concurrencies (was: raise when
+            # concurrency<=1, which aborted the whole live-batch on one ReadTimeout).
+            # LaneLease.start() overwrites state within the same lease, so later cases
+            # can proceed; failed cases remain for --resume / operator retry.
+            print(f"[case] {ins_id} BLOCKED (continue): {msg}", flush=True)
+            _append_summary(
                 {
                     "case_id": ins_id,
                     "execution_id": execution_id,
-                    "attribution_status": meta["attribution_status"],
+                    "attribution_status": meta.get("attribution_status"),
                     "bundle_case_id": bundle_id,
                     "http_status": status,
                     "ms": wall_ms,
-                    "ok": ok,
+                    "ok": False,
                     "busy": busy,
                     "llm_calls": n_calls,
                     "answer": (answer or "")[:500],
-                    "error": meta["error"],
+                    "error": msg,
                 }
             )
+            return
+
+        preview = (answer or "")[:120].replace("\n", " ")
+        status_s = "OK" if ok else "FAIL"
+        print(
+            f"[case] {ins_id} {status_s} http={status} wall_ms={wall_ms} busy={busy} "
+            f"err={err!r} answer={preview!r}",
+            flush=True,
+        )
+        _append_summary(
+            {
+                "case_id": ins_id,
+                "execution_id": execution_id,
+                "attribution_status": meta["attribution_status"],
+                "bundle_case_id": bundle_id,
+                "http_status": status,
+                "ms": wall_ms,
+                "ok": ok,
+                "busy": busy,
+                "llm_calls": n_calls,
+                "answer": (answer or "")[:500],
+                "error": meta["error"],
+            }
+        )
+
+    if concurrency <= 1:
+        with LaneLease(lane_directory, lane_id) as lane:
+            for bundle_id, ins_id, turns in selected:
+                _run_one_insurance_case(bundle_id, ins_id, turns, lane)
+    else:
+        # Dual-id headers attribute; exclusive LaneLease would serialize — skip it.
+        null_lane = _NullLane()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
+            import time as _stagger_time
+            futs = []
+            for _si, (bundle_id, ins_id, turns) in enumerate(selected):
+                _delay = _case_submit_delay(_si)
+                if _delay > 0:
+                    print(f"[live-batch] stagger submit i={_si} sleep={_delay:.2f}s", flush=True)
+                    _stagger_time.sleep(_delay)
+                futs.append(pool.submit(_run_one_insurance_case, bundle_id, ins_id, turns, null_lane))
+            errors = []
+            for fut in concurrent.futures.as_completed(futs):
+                exc = fut.exception()
+                if exc is not None:
+                    errors.append(exc)
+                    print(f"[live-batch] worker error: {exc!r}", flush=True)
+            if errors:
+                raise errors[0]
 
     # A subset resume must not replace the full run summary with only the
     # selected cases. Reconstruct from the durable case directories, as the

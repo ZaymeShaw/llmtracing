@@ -13,8 +13,10 @@ import re
 from typing import Any
 
 CASE_HEADER = "x-eval-case-id"
+EXECUTION_HEADER = "x-eval-execution-id"
 _CASE_MARKER_RE = re.compile(r"<!--\s*eval_case_id:([A-Za-z0-9_.-]+)\s*-->")
 _CASE_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+_EXECUTION_ID_RE = re.compile(r"^[A-Za-z0-9_.:/-]+$")
 
 
 def _norm(value: Any) -> str | None:
@@ -91,6 +93,39 @@ def _from_header(headers: Any) -> str | None:
     for k, v in headers.items():
         if str(k).lower() == CASE_HEADER:
             return _norm(v)
+    return None
+
+
+def _from_header_execution_id(headers: Any) -> str | None:
+    """Extract X-Eval-Execution-Id from request headers."""
+    if not isinstance(headers, dict):
+        return None
+    for k, v in headers.items():
+        if str(k).lower() == EXECUTION_HEADER:
+            val = v.strip() if isinstance(v, str) else str(v).strip()
+            if val and _EXECUTION_ID_RE.match(val):
+                return val
+    return None
+
+
+def extract_execution_id(
+    *,
+    headers: Any = None,
+    body: Any = None,
+    optional_params: Any = None,
+) -> str | None:
+    """Return execution_id from headers or body metadata."""
+    eid = _from_header_execution_id(headers)
+    if eid:
+        return eid
+    # Also check body.metadata.eval_execution_id
+    for source in (body, optional_params):
+        if isinstance(source, dict):
+            meta = source.get("metadata")
+            if isinstance(meta, dict):
+                val = meta.get("eval_execution_id")
+                if isinstance(val, str) and val.strip() and _EXECUTION_ID_RE.match(val.strip()):
+                    return val.strip()
     return None
 
 

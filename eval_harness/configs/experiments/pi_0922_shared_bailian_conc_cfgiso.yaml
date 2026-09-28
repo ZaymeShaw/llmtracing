@@ -1,0 +1,5 @@
+# Additive 2026-09-28: same as pi_0922_shared_bailian_conc.yaml + pi_agent_dir=per_case (config isolation)
+profile_path: ../profiles/pi_bailian_conc_cfgiso.yaml
+bundle_path: ../../bundles/120_prompt_only_0922_shared_pi.jsonl
+dataset_path: ../../data/120题-仅问句版-0922.md
+gold_dataset_path: ../../data/复杂协同与上下文问题集-120题(2).md

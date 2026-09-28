@@ -247,7 +247,8 @@ def _html_ok(path: Path) -> bool:
         return False
 
 
-def _run_claude(*, dual_root: Path, cases: str, config: Path, resume: bool = False) -> dict[str, Any]:
+def _run_claude(*, dual_root: Path, cases: str, config: Path, resume: bool = False,
+                skip_preflight: bool = False) -> dict[str, Any]:
     from eval_harness.run import main as claude_main
 
     argv = [
@@ -262,6 +263,8 @@ def _run_claude(*, dual_root: Path, cases: str, config: Path, resume: bool = Fal
     ]
     if resume:
         argv.append("--resume")
+    if skip_preflight:
+        argv.append("--skip-preflight")
     print(
         f"[dual] Claude start config={config} run_id=claude "
         f"eval_runs_dir={dual_root} cases={cases}",
@@ -456,7 +459,8 @@ def _pi_case_ids(case_ids: list[str], prefix: str = "PI_") -> list[str]:
     return out
 
 
-def _run_pi(*, dual_root: Path, cases: str, config: Path, resume: bool = False) -> dict[str, Any]:
+def _run_pi(*, dual_root: Path, cases: str, config: Path, resume: bool = False,
+            skip_preflight: bool = False) -> dict[str, Any]:
     """Pi lane via eval_harness.run (profile harness=pi_coding). run_id=pi."""
     from eval_harness.run import main as pi_main
 
@@ -472,6 +476,8 @@ def _run_pi(*, dual_root: Path, cases: str, config: Path, resume: bool = False) 
     ]
     if resume:
         argv.append("--resume")
+    if skip_preflight:
+        argv.append("--skip-preflight")
     print(
         f"[dual] Pi start config={config} run_id=pi "
         f"eval_runs_dir={dual_root} cases={cases}",
@@ -501,6 +507,56 @@ def _run_pi(*, dual_root: Path, cases: str, config: Path, resume: bool = False) 
         "html_ok": _html_ok(html),
         "error": err,
     }
+
+
+def lane_upstream(run_dir: Path, side: str) -> dict[str, Any]:
+    """Backend/upstream exposure of one agent lane (run_meta.upstream + live alert file);
+    prints a status line. Upstream trouble never fails the lane, it is only surfaced."""
+    from eval_harness.tool_health import format_status, status_line
+
+    run_dir = Path(run_dir)
+    out: dict[str, Any] = {}
+    try:
+        meta = json.loads((run_dir / "run_meta.json").read_text(encoding="utf-8"))
+        u = meta.get("upstream") or {}
+        out = {k: u.get(k) for k in ("cases", "tool_infra_error", "upstream_blocked", "upstream_degraded",
+                                     "blocked_ids", "upstream_errors")}
+    except Exception:
+        pass
+    try:
+        st = status_line(run_dir)
+        out["alert"] = st.get("alert")
+        line = format_status(st, side)
+        if out.get("upstream_blocked") or out.get("upstream_degraded") or st.get("alert"):
+            line = "!" * 10 + " " + line
+        print(f"[dual] {line}", flush=True)
+    except Exception as e:
+        print(f"[dual] WARN upstream status unavailable for {side}: {e!r}", flush=True)
+    return out
+
+
+def mandatory_preflight(
+    *, agents: list[str], claude_config: Optional[Path], pi_config: Optional[Path], out_dir: Path,
+) -> dict[str, Any]:
+    """New mandatory health gate (eval_harness.preflight) for the selected lanes; exits 4 on failure.
+
+    The passing result is exported via EVAL_PREFLIGHT_RESULT so the per-lane run.py calls reuse it.
+    """
+    from eval_harness import preflight as pf
+
+    specs = []
+    if "claude" in agents and claude_config is not None:
+        specs.append(pf.spec_from_config_path(claude_config))
+    if "pi" in agents and pi_config is not None:
+        specs.append(pf.spec_from_config_path(pi_config))
+    res = pf.run_preflight(specs, eval_runs_dir=out_dir, include_insurance="insurance" in agents)
+    path = out_dir / "preflight.json"
+    path.write_text(json.dumps(res, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    if not res["ok"]:
+        print(pf.fail_message(res), flush=True)
+        raise SystemExit(pf.EXIT_PREFLIGHT_FAILED)
+    os.environ[pf.RESULT_ENV] = str(path)
+    return res
 
 
 def _write_manifest(dual_root: Path, manifest: dict[str, Any]) -> Path:
@@ -539,7 +595,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="PI_",
         help="Prefix applied to --cases for Pi lane (ledger isolation). Default PI_.",
     )
-    p.add_argument("--skip-preflight", action="store_true")
+    p.add_argument("--skip-preflight", action="store_true",
+                   help="TESTS ONLY: skip gateway + mandatory preflight (recorded in manifest/run_meta)")
     p.add_argument("--claude-only", action="store_true", help="Deprecated alias: --agents claude")
     p.add_argument("--insurance-only", action="store_true", help="Deprecated alias: --agents insurance")
     p.add_argument("--pi-only", action="store_true", help="Alias: --agents pi")
@@ -670,8 +727,20 @@ def main(argv: Optional[list[str]] = None) -> int:
                     if not _litellm_ok():
                         raise SystemExit("[preflight] FAIL: LiteLLM unhealthy — abort")
                 print("[preflight] LiteLLM OK (insurance stack skipped)", flush=True)
+            _pf = mandatory_preflight(
+                agents=agents,
+                claude_config=config if "claude" in agents else None,
+                pi_config=pi_config if "pi" in agents else None,
+                out_dir=dual_root,
+            )
+            manifest["preflight"] = {k: _pf[k] for k in ("ok", "at", "harnesses", "failed", "elapsed_s")}
+            manifest["preflight"]["file"] = str(dual_root / "preflight.json")
+            _write_manifest(dual_root, manifest)
         else:
-            print("[preflight] skipped", flush=True)
+            from eval_harness.preflight import skipped_record
+            print("[preflight] skipped via --skip-preflight (tests only; recorded)", flush=True)
+            manifest["preflight"] = skipped_record("--skip-preflight")
+            _write_manifest(dual_root, manifest)
 
         settings = MOCK_SYSTEM_ROOT / "workspaces" / "claude" / ".claude" / "settings.local.json"
         if "claude" in agents and settings.is_file():
@@ -693,7 +762,8 @@ def main(argv: Optional[list[str]] = None) -> int:
 
         if "claude" in agents:
             claude_info = _run_claude(
-                dual_root=dual_root, cases=cases_csv, config=config, resume=bool(args.resume)
+                dual_root=dual_root, cases=cases_csv, config=config, resume=bool(args.resume),
+                skip_preflight=bool(args.skip_preflight),
             )
         else:
             claude_info = {"ok": False, "skipped": True, "html_ok": False}
@@ -713,6 +783,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 cases=pi_cases_csv,
                 config=pi_config,
                 resume=bool(args.resume),
+                skip_preflight=bool(args.skip_preflight),
             )
         else:
             pi_info = {"ok": False, "skipped": True, "html_ok": False}
@@ -734,6 +805,26 @@ def main(argv: Optional[list[str]] = None) -> int:
         status = "success" if both else "failed"
         exit_code = 0 if both else 2
 
+        # Secret-scan gate over the whole stamp root (incl. insurance, which has no per-run gate).
+        from eval_harness.secret_scan import scan as _secret_scan
+        _rep = _secret_scan([dual_root])
+        (dual_root / "secret_scan.json").write_text(
+            json.dumps(_rep.to_dict(), ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+        manifest["secret_scan"] = "PASS" if _rep.ok else "FAILED"
+        if not _rep.ok:
+            print("!" * 78 + "\n[dual] SECRET SCAN FAILED — NOT A PRODUCT (llm_trace.html not final)\n"
+                  + _rep.summary_text() + "\n" + "!" * 78, flush=True)
+            both = False
+            status = "failed_secret_scan"
+            exit_code = 3
+        else:
+            print(f"[dual] {_rep.summary_text().splitlines()[0]}", flush=True)
+
+        manifest["upstream"] = {
+            side: lane_upstream(dual_root / side, side)
+            for side in ("claude", "pi") if side in agents
+        }
         manifest.update(
             {
                 "finished": _now_iso(),
