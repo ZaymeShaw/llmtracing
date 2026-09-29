@@ -90,7 +90,8 @@ if [[ "${GATEWAY_DIRECT_UPSTREAM:-auto}" == "1" || ( "${GATEWAY_DIRECT_UPSTREAM:
   echo "upstream $_up_host: direct (NO_PROXY set, system proxy bypassed)"
 fi
 
-export LLM_ATTRIBUTION_CONFIG="${LLM_ATTRIBUTION_CONFIG:-$DIR/attribution_lanes.json}"
+# Header-based tracing needs no lane configuration. Insurance enables its
+# exclusive lane explicitly in start_insurance_litellm.sh.
 
 if [[ -z "$UPSTREAM_API_KEY" ]]; then
   echo "UPSTREAM_API_KEY missing — set it in $ENV_FILE" >&2
@@ -158,7 +159,7 @@ fi
 
 if [[ "$healthy" -eq 1 && "$FORCE_RESTART" -eq 0 ]]; then
   sync_claude_if_requested
-  if ! python3 - "$LLM_ATTRIBUTION_CONFIG" "$DIR/run/litellm.pid" <<'PY'
+  if [[ -n "${LLM_ATTRIBUTION_CONFIG:-}" ]] && ! python3 - "$LLM_ATTRIBUTION_CONFIG" "$DIR/run/litellm.pid" <<'PY'
 import hashlib, json, pathlib, sys
 try:
     cfg = pathlib.Path(sys.argv[1]).resolve()
