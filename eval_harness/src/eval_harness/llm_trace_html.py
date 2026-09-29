@@ -904,6 +904,23 @@ def _load_case_overview(case_dir: Path, *, calls: list[dict[str, Any]] | None = 
     except Exception as e:
         return {"available": False, "error": f"trace.json 解析失败: {e}"}
 
+    # Minimal adapters report execution status only. Recover their conversation
+    # exactly as for direct gateway runs, while retaining harness status/timing.
+    if not trace.get("turns") and not trace.get("events"):
+        wire_calls = calls if calls is not None else _load_calls(case_dir)
+        if wire_calls:
+            overview = _wire_only_overview(case_dir, wire_calls)
+            overview["execution_metadata"] = True
+            overview["case_id"] = trace.get("case_id") or case_dir.name
+            for key in ("success", "exit_code", "error"):
+                overview[key] = trace.get(key)
+            overview["metrics"]["wall_ms"] = (trace.get("metrics") or {}).get("wall_ms")
+            overview["artifacts"] = {**(trace.get("artifacts") or {}), **overview["artifacts"]}
+            overview["note"] = overview["note"].replace(
+                "无 harness Trace；整案总览由中转 llm_calls 合成（wire-only）",
+                "Adapter 提供执行状态；各轮对话和模型指标由中转 llm_calls 还原")
+            return overview
+
     metrics_src = trace.get("metrics") if isinstance(trace.get("metrics"), dict) else {}
     metric_keys = (
         "wall_ms",

@@ -156,3 +156,37 @@ def test_cli_first_character_skips_tools_and_empty_blocks(kind):
     for detect, events in ((claude, claude_events), (pi, pi_events)):
         assert detect(events, 1000, [1000.1, 1000.2, 1000.7]) == (700, kind)
         assert detect(events[:2], 1000, [1000.1, 1000.2]) == (None, None)
+
+
+@pytest.mark.parametrize("success", [True, False])
+def test_status_only_adapter_restores_turns_and_keeps_execution_status(tmp_path, success):
+    from eval_harness.adapters.base import CaseRunResult
+    from eval_harness.normalize_trace import build_trace
+    case = tmp_path / "cases/A01"
+    case.mkdir(parents=True)
+    result = CaseRunResult(case_id="A01", session_id=None, turns=[], success=success,
+                           exit_code=0 if success else 1, error=None if success else "timeout", wall_ms=9000)
+    trace = build_trace(result, harness="custom")
+    (case / "trace.json").write_text(json.dumps(trace))
+    rows = []
+    for i, (users, answer, delta) in enumerate([
+        (["Generate a title", "Q1"], "Title", 20),
+        (["Q1"], "Answer 1", 500),
+        (["Q1", "Q2"], "Answer 2", 600),
+    ]):
+        rows.append({"call_id": str(i), "ts": f"2026-09-29T00:00:0{i}Z",
+                     "first_frame_ms": delta, "first_frame_kind": "text",
+                     "request": {"messages": [{"role": "user", "content": u} for u in users]},
+                     "response": {"choices": [{"message": {"content": answer}}]}})
+    (case / "llm_calls.jsonl").write_text("\n".join(json.dumps(r) for r in rows))
+    overview = build_payload(tmp_path)["cases"][0]["overview"]
+    assert [(t["prompt"], t["final_text"]) for t in overview["turns"]] == [
+        ("Q1", "Answer 1"), ("Q2", "Answer 2")]
+    assert overview["metrics"]["num_turns"] == 2
+    assert overview["metrics"]["first_frame_ms"] == 500
+    assert overview["metrics"]["wall_ms"] == 9000
+    assert overview["success"] is success
+    assert overview["exit_code"] == result.exit_code
+    assert overview["error"] == result.error
+    assert overview["execution_metadata"] is True
+    assert json.loads((case / "trace.json").read_text()) == trace
