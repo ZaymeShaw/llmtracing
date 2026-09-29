@@ -60,7 +60,10 @@ def test_native_protocol_without_runner(protocol, tmp_path, monkeypatch):
     assert last['stop_reason'] or last['response_status'] == 'completed'
     assert case['overview']['success'] is None
     assert case['overview']['metrics']['wall_ms'] is None
-    assert case['overview']['metrics']['num_turns'] is None
+    assert case['overview']['metrics']['num_turns'] == 2
+    assert [t['prompt'] for t in case['overview']['turns']] == ['Q1', 'Q2']
+    assert case['overview']['turns'][0]['final_text'] == ''
+    assert case['overview']['turns'][1]['final_text'] == 'MODEL_FINAL'
     assert case['overview']['metrics']['first_frame_ms'] is None
     assert 'DO-NOT-LOG-HEADER' not in log.read_text()
     assert 'DO-NOT-LOG-BODY-KEY' not in log.read_text()

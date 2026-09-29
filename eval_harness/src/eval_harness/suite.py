@@ -32,14 +32,15 @@ from zoneinfo import ZoneInfo
 TZ = ZoneInfo("Asia/Shanghai")
 
 from eval_harness.paths import PROJECT_ROOT as MOCK_SYSTEM_ROOT
+from eval_harness.agent_env import parse_env_file
 EVAL_HARNESS_ROOT = MOCK_SYSTEM_ROOT / "eval_harness"
 DEFAULT_EVAL_RUNS_DIR = MOCK_SYSTEM_ROOT / "eval_runs"
 DEFAULT_BUNDLE = EVAL_HARNESS_ROOT / "bundles" / "120_prompt_only_v1.jsonl"
 DEFAULT_CLAUDE_CONFIG = EVAL_HARNESS_ROOT / "configs/runs/claude.yaml"
 DEFAULT_PI_CONFIG = EVAL_HARNESS_ROOT / "configs/runs/pi.yaml"
 KNOWN_AGENTS = ("claude", "insurance", "pi")
-LITELLM_URL = "http://127.0.0.1:4001/v1/models"
-INSURANCE_LITELLM_URL = "http://127.0.0.1:4002/v1/models"
+PRIMARY_RELAY_DIR = MOCK_SYSTEM_ROOT / "llm_gateway"
+INSURANCE_RELAY_PROFILE = MOCK_SYSTEM_ROOT / "llm_gateway" / ".env.insurance_4002"
 INSURANCE_CHAT_URL = "http://127.0.0.1:18063/v1/chat"
 INSURANCE_HEALTH_URL = "http://127.0.0.1:18063/health"
 START_LITELLM_SH = MOCK_SYSTEM_ROOT / "llm_gateway" / "start_litellm.sh"
@@ -85,35 +86,49 @@ def _no_proxy_env() -> None:
 
 
 def _master_key() -> str:
-    key = os.environ.get("LITELLM_MASTER_KEY", "").strip()
-    if key:
-        return key
-    env_path = MOCK_SYSTEM_ROOT / "llm_gateway" / ".env"
-    if env_path.is_file():
-        for line in env_path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            k, _, v = line.partition("=")
-            if k.strip() == "LITELLM_MASTER_KEY":
-                return v.strip().strip('"').strip("\'")
-    raise RuntimeError("LITELLM_MASTER_KEY is not set")
+    key = parse_env_file(_primary_relay_profile()).get("LITELLM_MASTER_KEY", "")
+    if not key:
+        raise RuntimeError(f"LITELLM_MASTER_KEY missing in {_primary_relay_profile()}")
+    return key
+
+
+def _primary_relay_profile() -> Path:
+    active = PRIMARY_RELAY_DIR / "run" / "active_env_file"
+    if active.is_file():
+        path = Path(active.read_text(encoding="utf-8").strip())
+        if path.is_file():
+            return path
+    return PRIMARY_RELAY_DIR / ".env"
+
+
+def _litellm_url() -> str:
+    profile = parse_env_file(_primary_relay_profile())
+    host = profile.get("LITELLM_HOST")
+    port = profile.get("LITELLM_PORT")
+    if not host or not port:
+        raise RuntimeError(f"Primary relay host/port missing in {_primary_relay_profile()}")
+    return f"http://{host}:{port}/v1/models"
+
+
+def _primary_start_command() -> list[str]:
+    command = ["bash", str(START_LITELLM_SH)]
+    profile_name = _primary_relay_profile().name
+    if profile_name != ".env":
+        command.extend(["--profile", profile_name.removeprefix(".env.")])
+    return command
 
 
 def _insurance_master_key() -> str:
-    key = os.environ.get("INSURANCE_LITELLM_MASTER_KEY", "").strip()
-    if key:
-        return key
-    env_path = MOCK_SYSTEM_ROOT / "llm_gateway" / ".env"
-    if env_path.is_file():
-        for line in env_path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            name, _, value = line.partition("=")
-            if name.strip() == "INSURANCE_LITELLM_MASTER_KEY":
-                return value.strip().strip('"').strip("'")
-    return ""
+    return parse_env_file(INSURANCE_RELAY_PROFILE).get("LITELLM_MASTER_KEY", "")
+
+
+def _insurance_litellm_url() -> str:
+    profile = parse_env_file(INSURANCE_RELAY_PROFILE)
+    host = profile.get("LITELLM_HOST")
+    port = profile.get("LITELLM_PORT")
+    if not host or not port:
+        raise RuntimeError(f"Insurance relay host/port missing in {INSURANCE_RELAY_PROFILE}")
+    return f"http://{host}:{port}/v1/models"
 
 
 def _http_get(
@@ -142,7 +157,7 @@ def _http_get(
 
 def _litellm_ok() -> bool:
     code, _ = _http_get(
-        LITELLM_URL,
+        _litellm_url(),
         headers={"Authorization": f"Bearer {_master_key()}"},
         timeout=5.0,
     )
@@ -154,7 +169,7 @@ def _insurance_litellm_ok() -> bool:
     if not key:
         return False
     code, _ = _http_get(
-        INSURANCE_LITELLM_URL,
+        _insurance_litellm_url(),
         headers={"Authorization": f"Bearer {key}"},
         timeout=5.0,
     )
@@ -168,12 +183,12 @@ def _insurance_ok() -> bool:
 
 def preflight(*, try_start_litellm: bool = True) -> None:
     _no_proxy_env()
-    print(f"[preflight] LiteLLM {LITELLM_URL}", flush=True)
+    print(f"[preflight] LiteLLM {_litellm_url()}", flush=True)
     if not _litellm_ok():
         if try_start_litellm and START_LITELLM_SH.is_file():
             print(f"[preflight] LiteLLM down — starting via {START_LITELLM_SH}", flush=True)
             subprocess.run(
-                ["bash", str(START_LITELLM_SH)],
+                _primary_start_command(),
                 cwd=str(START_LITELLM_SH.parent),
                 check=False,
                 timeout=90,
@@ -191,7 +206,7 @@ def preflight(*, try_start_litellm: bool = True) -> None:
     else:
         print("[preflight] LiteLLM OK", flush=True)
 
-    print(f"[preflight] Insurance LiteLLM {INSURANCE_LITELLM_URL}", flush=True)
+    print(f"[preflight] Insurance LiteLLM {_insurance_litellm_url()}", flush=True)
     if not _insurance_litellm_ok():
         if try_start_litellm and START_INSURANCE_LITELLM_SH.is_file():
             print(
@@ -708,7 +723,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             else:
                 # Claude/Pi-only: main LiteLLM only (skip Insurance stack)
                 _no_proxy_env()
-                print(f"[preflight] LiteLLM {LITELLM_URL}", flush=True)
+                print(f"[preflight] LiteLLM {_litellm_url()}", flush=True)
                 if not _litellm_ok():
                     if START_LITELLM_SH.is_file():
                         print(

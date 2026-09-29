@@ -371,35 +371,30 @@ def _extract_final_text(events: list[dict]) -> str:
 
 
 def _detect_first_frame(events: list[dict], t0: float, line_ts: list[float]) -> tuple[Optional[int], Optional[str]]:
+    """First observed text/thinking character; tool events do not count."""
     for i, ev in enumerate(events):
         if not isinstance(ev, dict):
             continue
-        kind = None
-        et = ev.get("type")
-        if et == "tool_execution_start":
-            kind = "tool_use"
-        elif et == "message_update":
+        candidates = []
+        if ev.get("type") == "message_update":
             ame = ev.get("assistantMessageEvent") or {}
-            if isinstance(ame, dict) and ame.get("type") == "text_delta":
-                kind = "text"
-        elif et == "message_end":
+            if isinstance(ame, dict) and ame.get("type") in ("text_delta", "thinking_delta"):
+                candidates.append((ame["type"].removesuffix("_delta"), ame.get("delta")))
+        elif ev.get("type") == "message_end":
             msg = ev.get("message") or {}
             if isinstance(msg, dict) and msg.get("role") == "assistant":
-                # tool vs text
                 content = msg.get("content")
                 if isinstance(content, list):
                     for block in content:
-                        if isinstance(block, dict) and block.get("type") in ("toolCall", "tool_use", "functionCall"):
-                            kind = "tool_use"
-                            break
-                    else:
-                        if _message_text(msg):
-                            kind = "text"
-                elif _message_text(msg):
-                    kind = "text"
-        if kind:
-            ts = line_ts[i] if i < len(line_ts) else time.time()
-            return int((ts - t0) * 1000), kind
+                        if isinstance(block, dict) and block.get("type") in ("text", "thinking"):
+                            candidates.append((block["type"], block.get(block["type"])))
+                elif isinstance(content, str):
+                    candidates.append(("text", content))
+        for kind, value in candidates:
+            if isinstance(value, str) and value.strip():
+                if i >= len(line_ts):
+                    return None, None
+                return round((line_ts[i] - t0) * 1000), kind
     return None, None
 
 

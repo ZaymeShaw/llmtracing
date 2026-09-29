@@ -203,45 +203,31 @@ def _extract_final_text(events: list[dict]) -> str:
 
 
 def _detect_first_frame(events: list[dict], t0: float, line_ts: list[float]) -> tuple[Optional[int], Optional[str]]:
+    """First observed text/thinking character; empty starts and tools do not count."""
     for i, ev in enumerate(events):
         if not isinstance(ev, dict):
             continue
-        kind = None
-        et = ev.get("type")
-        if et in ("stream_event", "partial", "content_block_delta"):
-            inner = ev.get("event") if isinstance(ev.get("event"), dict) else ev
-            if isinstance(inner, dict):
-                if inner.get("type") == "content_block_start":
-                    cb = inner.get("content_block") or {}
-                    if cb.get("type") == "tool_use":
-                        kind = "tool_use"
-                    elif cb.get("type") == "text":
-                        kind = "text"
-                if inner.get("type") == "content_block_delta":
-                    d = inner.get("delta") or {}
-                    if d.get("type") == "text_delta":
-                        kind = "text"
-            delta = ev.get("delta") or {}
-            if isinstance(delta, dict) and delta.get("type") == "text_delta":
-                kind = "text"
-        if et == "assistant":
+        inner = ev.get("event") if isinstance(ev.get("event"), dict) else ev
+        blocks = []
+        if inner.get("type") == "content_block_start":
+            blocks.append(inner.get("content_block") or {})
+        if inner.get("type") == "content_block_delta":
+            blocks.append(inner.get("delta") or {})
+        if ev.get("type") == "assistant":
             msg = ev.get("message") or {}
             content = msg.get("content") if isinstance(msg, dict) else None
             if isinstance(content, list):
-                for block in content:
-                    if not isinstance(block, dict):
-                        continue
-                    if block.get("type") == "tool_use":
-                        kind = "tool_use"
-                        break
-                    if block.get("type") == "text" and (block.get("text") or "").strip():
-                        kind = "text"
-                        break
-        if et == "tool_use":
-            kind = kind or "tool_use"
-        if kind:
-            ts = line_ts[i] if i < len(line_ts) else time.time()
-            return int((ts - t0) * 1000), kind
+                blocks.extend(content)
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            typ = block.get("type")
+            kind = "text" if typ in ("text", "text_delta") else "thinking" if typ in ("thinking", "thinking_delta") else None
+            value = block.get(kind) if kind else None
+            if isinstance(value, str) and value.strip():
+                if i >= len(line_ts):
+                    return None, None
+                return round((line_ts[i] - t0) * 1000), kind
     return None, None
 
 

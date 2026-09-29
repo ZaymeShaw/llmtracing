@@ -76,6 +76,13 @@ def load_gateway_pairs(log_path: Path, *, start_offset: int = 0, strict: bool = 
             if rec.get(key) is not None and slot.get(key) is None:
                 slot[key] = rec[key]
         ev = rec.get("event")
+        if ev == "first_frame":
+            measured = rec.get("first_frame_ms")
+            if isinstance(measured, (int, float)) and measured >= 0 and (
+                slot.get("first_frame_ms") is None or measured < slot["first_frame_ms"]
+            ):
+                for key in ("first_frame_ms", "first_frame_kind", "first_frame_at"):
+                    slot[key] = rec.get(key)
 
         # ---- thin reverse proxy: wire JSON already in rec["request"] ----
         if ev == "request":
@@ -309,6 +316,7 @@ def pairs_to_trace_calls(pairs: list[dict[str, Any]], *, case_id: str) -> list[d
                 "stream": p.get("stream"),
                 "status_code": p.get("status_code"),
                 "latency_ms": p.get("latency_ms"),
+                **{k: p.get(k) for k in ("first_frame_ms", "first_frame_kind", "first_frame_at")},
                 "source": p.get("source"),
                 "request": req,
                 "response": p.get("response"),

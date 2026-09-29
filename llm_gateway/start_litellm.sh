@@ -7,6 +7,7 @@ source "$DIR/.venv/bin/activate"
 
 PROFILE=""
 FORCE_RESTART=0
+FOREGROUND=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --profile|-p)
@@ -17,13 +18,18 @@ while [[ $# -gt 0 ]]; do
       FORCE_RESTART=1
       shift
       ;;
+    --foreground)
+      FOREGROUND=1
+      shift
+      ;;
     -h|--help)
       cat <<'HELP'
-Usage: ./start_litellm.sh [--profile NAME] [--restart]
+Usage: ./start_litellm.sh [--profile NAME] [--restart] [--foreground]
 
   (no args)           load .env (current default upstream)
   --profile NAME      load .env.NAME instead (e.g. aliyun_maas, penguin)
   --restart           stop existing listener even if healthy (needed when switching)
+  --foreground        run this profile in the current terminal without touching another listener/PID
 
 Examples:
   ./stop_litellm.sh && ./start_litellm.sh
@@ -58,20 +64,16 @@ if [[ -n "$PROFILE" ]]; then
   fi
 fi
 
-if [[ -f "$ENV_FILE" ]]; then
-  set -a
-  # shellcheck disable=SC1090
-  source "$ENV_FILE"
-  set +a
-  echo "loaded env: $ENV_FILE"
-else
-  echo "warning: no env file at $ENV_FILE" >&2
-fi
+[[ -f "$ENV_FILE" ]] || { echo "missing relay profile: $ENV_FILE" >&2; exit 1; }
+for key in UPSTREAM_API_BASE UPSTREAM_API_KEY UPSTREAM_PROTOCOL UPSTREAM_MODEL LITELLM_HOST LITELLM_PORT LITELLM_MASTER_KEY LLM_GATEWAY_LOG_DIR LITELLM_CONFIG; do
+  grep -Eq "^(export )?${key}=" "$ENV_FILE" || { echo "missing $key in $ENV_FILE" >&2; exit 1; }
+done
+set -a
+# shellcheck disable=SC1090
+source "$ENV_FILE"
+set +a
+echo "loaded env: $ENV_FILE"
 
-export UPSTREAM_API_BASE="${UPSTREAM_API_BASE:-https://dashscope.aliyuncs.com/apps/anthropic}"
-export UPSTREAM_API_KEY="${UPSTREAM_API_KEY:-}"
-export UPSTREAM_PROTOCOL="${UPSTREAM_PROTOCOL:-anthropic}"
-export UPSTREAM_MODEL="${UPSTREAM_MODEL:-deepseek-v4-flash-0731}"
 export UPSTREAM_LITELLM_MODEL="${UPSTREAM_PROTOCOL}/${UPSTREAM_MODEL}"
 export ANTHROPIC_API_KEY="$UPSTREAM_API_KEY"
 
@@ -88,10 +90,6 @@ if [[ "${GATEWAY_DIRECT_UPSTREAM:-auto}" == "1" || ( "${GATEWAY_DIRECT_UPSTREAM:
   echo "upstream $_up_host: direct (NO_PROXY set, system proxy bypassed)"
 fi
 
-export LITELLM_HOST="${LITELLM_HOST:-127.0.0.1}"
-export LITELLM_PORT="${LITELLM_PORT:-4001}"
-export LITELLM_MASTER_KEY="${LITELLM_MASTER_KEY:-}"
-export LLM_GATEWAY_LOG_DIR="${LLM_GATEWAY_LOG_DIR:-$DIR/logs}"
 export LLM_ATTRIBUTION_CONFIG="${LLM_ATTRIBUTION_CONFIG:-$DIR/attribution_lanes.json}"
 
 if [[ -z "$UPSTREAM_API_KEY" ]]; then
@@ -118,14 +116,19 @@ NEW_PROFILE="${PROFILE:-default}"
 export LLM_GATEWAY_PROFILE="$NEW_PROFILE"
 
 # Switching profiles requires restart even if port looks healthy
-if [[ -n "$PREV_PROFILE" && "$PREV_PROFILE" != "$NEW_PROFILE" ]]; then
+if [[ "$FOREGROUND" -eq 0 && -n "$PREV_PROFILE" && "$PREV_PROFILE" != "$NEW_PROFILE" ]]; then
   FORCE_RESTART=1
   echo "profile change: $PREV_PROFILE -> $NEW_PROFILE (will restart)"
 fi
 
-CFG="${LITELLM_CONFIG:-$DIR/config.litellm.with_master.yaml}"
-if [[ ! -f "$CFG" ]]; then CFG="$DIR/config.yaml"; fi
+CFG="$LITELLM_CONFIG"
+[[ -f "$CFG" ]] || { echo "missing LiteLLM config: $CFG" >&2; exit 1; }
 export LITELLM_CONFIG="$CFG"
+PROFILE_SHA256="$(cat "$ENV_FILE" "$CFG" | shasum -a 256 | cut -d ' ' -f 1)"
+PREV_SHA256="$(cat "$DIR/run/active_env_sha256" 2>/dev/null || true)"
+if [[ "$FOREGROUND" -eq 0 && "$PREV_SHA256" != "$PROFILE_SHA256" ]]; then
+  FORCE_RESTART=1
+fi
 
 # Relay startup is harness-independent; config synchronization is explicitly optional.
 sync_claude_if_requested() {
@@ -133,6 +136,19 @@ sync_claude_if_requested() {
     python3 "$DIR/sync_claude_settings.py"
   fi
 }
+
+if [[ "$FOREGROUND" -eq 1 ]]; then
+  sync_claude_if_requested
+  mkdir -p "$LLM_GATEWAY_LOG_DIR"
+  export LLM_ATTRIBUTION_GATEWAY_PROCESS=1
+  echo "starting profile=$NEW_PROFILE http://${LITELLM_HOST}:${LITELLM_PORT} log_dir=$LLM_GATEWAY_LOG_DIR"
+  exec litellm --config "$CFG" --host "$LITELLM_HOST" --port "$LITELLM_PORT" --telemetry False
+fi
+
+if [[ "$LITELLM_PORT" != "4001" ]]; then
+  echo "background launcher owns :4001; use --foreground for configured port $LITELLM_PORT" >&2
+  exit 1
+fi
 
 healthy=0
 if curl -fsS -m 2 "http://${LITELLM_HOST}:${LITELLM_PORT}/v1/models" \
@@ -167,6 +183,7 @@ if [[ "$healthy" -eq 1 && "$FORCE_RESTART" -eq 0 ]]; then
   echo "litellm already healthy on http://${LITELLM_HOST}:${LITELLM_PORT} (profile=$NEW_PROFILE)"
   echo "$NEW_PROFILE" >"$ACTIVE_FILE"
   echo "$ENV_FILE" >"$DIR/run/active_env_file"
+  echo "$PROFILE_SHA256" >"$DIR/run/active_env_sha256"
   exit 0
 fi
 
@@ -206,5 +223,6 @@ python3 "$DIR/_detach_litellm.py"
 
 echo "$NEW_PROFILE" >"$ACTIVE_FILE"
 echo "$ENV_FILE" >"$DIR/run/active_env_file"
+echo "$PROFILE_SHA256" >"$DIR/run/active_env_sha256"
 echo "started profile=$NEW_PROFILE"
 echo "upstream=$UPSTREAM_API_BASE protocol=$UPSTREAM_PROTOCOL model=$UPSTREAM_MODEL litellm_model=$UPSTREAM_LITELLM_MODEL"

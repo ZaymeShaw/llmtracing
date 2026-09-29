@@ -6,9 +6,8 @@ cd "$DIR"
 # shellcheck disable=SC1091
 source "$DIR/.venv/bin/activate"
 
-# Additive --profile: load .env.NAME instead of .env.
-# Never touches :4001 / Claude. Insurance LiteLLM only on :4002.
-PROFILE=""
+# This launcher owns the Insurance :4002 process; all connection values come from its profile.
+PROFILE="insurance_4002"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --profile|-p)
@@ -17,33 +16,22 @@ while [[ $# -gt 0 ]]; do
       cat <<'HELP'
 Usage: ./start_insurance_litellm.sh [--profile NAME]
 
-  Starts dedicated Insurance LiteLLM on :4002 only (does not restart :4001).
+  Starts dedicated Insurance LiteLLM on :4002 using .env.insurance_4002.
 
-  (no args)       load .env
-  --profile NAME  load .env.NAME (e.g. bailian, bailian_openai, aliyun_maas, penguin)
+  --profile NAME  load another dedicated .env.NAME profile configured for :4002
 HELP
       exit 0 ;;
     *)
-      if [[ -z "$PROFILE" && -f "$DIR/.env.$1" ]]; then PROFILE="$1"; shift
+      if [[ -f "$DIR/.env.$1" ]]; then PROFILE="$1"; shift
       else echo "unknown arg: $1" >&2; exit 2; fi ;;
   esac
 done
 
-# Sticky profile: if dual_run/preflight calls us with no --profile, keep the
-# last Insurance upstream (e.g. bailian_openai) instead of clobbering with .env.
-# Explicit --profile always wins. Never touches :4001.
-ENV_FILE="$DIR/.env"
-if [[ -z "$PROFILE" && -f "$DIR/run/active_insurance_profile" ]]; then
-  sticky="$(cat "$DIR/run/active_insurance_profile" 2>/dev/null || true)"
-  if [[ -n "$sticky" && "$sticky" != "default" && -f "$DIR/.env.$sticky" ]]; then
-    PROFILE="$sticky"
-    echo "Insurance LiteLLM sticky profile=$PROFILE (from run/active_insurance_profile)"
-  fi
-fi
-if [[ -n "$PROFILE" ]]; then
-  ENV_FILE="$DIR/.env.$PROFILE"
-  [[ -f "$ENV_FILE" ]] || { echo "missing $ENV_FILE" >&2; exit 1; }
-fi
+ENV_FILE="$DIR/.env.$PROFILE"
+[[ -f "$ENV_FILE" ]] || { echo "missing $ENV_FILE" >&2; exit 1; }
+for key in UPSTREAM_API_BASE UPSTREAM_API_KEY UPSTREAM_PROTOCOL UPSTREAM_MODEL LITELLM_HOST LITELLM_PORT LITELLM_MASTER_KEY LLM_GATEWAY_LOG_DIR LITELLM_CONFIG; do
+  grep -Eq "^(export )?${key}=" "$ENV_FILE" || { echo "missing $key in $ENV_FILE" >&2; exit 1; }
+done
 
 set -a
 # shellcheck disable=SC1090
@@ -51,9 +39,8 @@ source "$ENV_FILE"
 set +a
 echo "Insurance LiteLLM env=$ENV_FILE profile=${PROFILE:-default}"
 
-export LITELLM_HOST=127.0.0.1
-export LITELLM_PORT=4002
-export LITELLM_MASTER_KEY="${INSURANCE_LITELLM_MASTER_KEY:?missing Insurance gateway key}"
+: "${LITELLM_MASTER_KEY:?missing local gateway key}"
+[[ "$LITELLM_PORT" == "4002" ]] || { echo "Insurance profile must specify LITELLM_PORT=4002: $ENV_FILE" >&2; exit 1; }
 export UPSTREAM_LITELLM_MODEL="${UPSTREAM_PROTOCOL}/${UPSTREAM_MODEL}"
 export ANTHROPIC_API_KEY="$UPSTREAM_API_KEY"
 # Proxy bypass for *.aliyuncs.com upstreams (see start_litellm.sh for rationale).
@@ -63,29 +50,25 @@ if [[ "${GATEWAY_DIRECT_UPSTREAM:-auto}" == "1" || ( "${GATEWAY_DIRECT_UPSTREAM:
   export no_proxy="$NO_PROXY"
   echo "upstream $_up_host: direct (NO_PROXY set, system proxy bypassed)"
 fi
-export LLM_GATEWAY_LOG_DIR="$DIR/logs"
 export LLM_ATTRIBUTION_CONFIG="$DIR/attribution_lanes.json"
 export LLM_ATTRIBUTION_GATEWAY_PROCESS=1
 export LLM_GATEWAY_PROFILE="${PROFILE:-default}"
 export PYTHONPATH="$DIR${PYTHONPATH:+:$PYTHONPATH}"
 
 PID_FILE="$DIR/run/litellm_insurance.pid"
-DIAG_LOG="$DIR/logs/litellm_insurance.stdout.log"
-CFG="${LITELLM_CONFIG:-$DIR/config.litellm.insurance.yaml}"
-mkdir -p "$DIR/run" "$DIR/logs"
+DIAG_LOG="$LLM_GATEWAY_LOG_DIR/litellm_insurance.stdout.log"
+CFG="$LITELLM_CONFIG"
+[[ -f "$CFG" ]] || { echo "missing LiteLLM config: $CFG" >&2; exit 1; }
+mkdir -p "$DIR/run" "$LLM_GATEWAY_LOG_DIR"
 
-# Record active insurance upstream (no secrets)
-echo "${PROFILE:-default}" >"$DIR/run/active_insurance_profile"
-echo "$ENV_FILE" >"$DIR/run/active_insurance_env_file"
-echo "$UPSTREAM_API_BASE" >"$DIR/run/active_insurance_upstream_base"
+ENV_SHA256="$(cat "$ENV_FILE" "$CFG" | shasum -a 256 | cut -d ' ' -f 1)"
+PREV_PROFILE="$(cat "$DIR/run/active_insurance_profile" 2>/dev/null || true)"
+PREV_SHA256="$(cat "$DIR/run/active_insurance_env_sha256" 2>/dev/null || true)"
 
 # If healthy but we want a specific profile, restart :4002 only when profile requested
 if curl -fsS -m 2 "http://$LITELLM_HOST:$LITELLM_PORT/v1/models" \
   -H "Authorization: Bearer $LITELLM_MASTER_KEY" >/dev/null 2>&1; then
-  prev_profile="$(cat "$DIR/run/active_insurance_profile" 2>/dev/null || true)"
-  prev_base="$(cat "$DIR/run/active_insurance_upstream_base" 2>/dev/null || true)"
-  want_profile="${PROFILE:-default}"
-  if [[ "$prev_profile" == "$want_profile" && "$prev_base" == "$UPSTREAM_API_BASE" && "${FORCE_INSURANCE_RESTART:-0}" != "1" ]]; then
+  if [[ "$PREV_PROFILE" == "$PROFILE" && "$PREV_SHA256" == "$ENV_SHA256" && "${FORCE_INSURANCE_RESTART:-0}" != "1" ]]; then
     if python3 - "$LLM_ATTRIBUTION_CONFIG" "$PID_FILE" "$LITELLM_PORT" <<'PY'
 import hashlib, json, pathlib, sys
 try:
@@ -103,11 +86,12 @@ except (OSError, ValueError, KeyError, AssertionError):
     sys.exit(1)
 PY
     then
-      echo "Insurance LiteLLM already healthy on :$LITELLM_PORT profile=$want_profile"
+      echo "Insurance LiteLLM already healthy on :$LITELLM_PORT profile=$PROFILE"
       # refresh markers
-      echo "$want_profile" >"$DIR/run/active_insurance_profile"
+      echo "$PROFILE" >"$DIR/run/active_insurance_profile"
       echo "$ENV_FILE" >"$DIR/run/active_insurance_env_file"
       echo "$UPSTREAM_API_BASE" >"$DIR/run/active_insurance_upstream_base"
+      echo "$ENV_SHA256" >"$DIR/run/active_insurance_env_sha256"
       exit 0
     fi
     echo "Insurance attribution callback not ready on :$LITELLM_PORT; restarting"
@@ -115,7 +99,7 @@ PY
   if [[ "${FORCE_INSURANCE_RESTART:-0}" == "1" ]]; then
     echo "FORCE_INSURANCE_RESTART=1 — restarting :4002"
   fi
-  echo "Restarting :4002 to switch profile $prev_profile -> $want_profile (Claude :4001 untouched)"
+  echo "Restarting :4002 to load profile $PROFILE (Claude :4001 untouched)"
 fi
 
 if [[ -f "$PID_FILE" ]]; then
@@ -137,5 +121,9 @@ fi
 export LITELLM_CONFIG="$CFG"
 : >>"$DIAG_LOG"
 python3 "$DIR/_detach_insurance_litellm.py"
+echo "$PROFILE" >"$DIR/run/active_insurance_profile"
+echo "$ENV_FILE" >"$DIR/run/active_insurance_env_file"
+echo "$UPSTREAM_API_BASE" >"$DIR/run/active_insurance_upstream_base"
+echo "$ENV_SHA256" >"$DIR/run/active_insurance_env_sha256"
 pid="$(cat "$PID_FILE" 2>/dev/null || true)"
 echo "Insurance LiteLLM healthy pid=$pid port=$LITELLM_PORT upstream=$UPSTREAM_API_BASE protocol=$UPSTREAM_PROTOCOL model=$UPSTREAM_MODEL cfg=$CFG"

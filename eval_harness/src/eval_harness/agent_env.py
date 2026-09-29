@@ -157,7 +157,7 @@ def load_upstream_secrets(
 def load_local_gateway_keys(
     gateway_dir: Optional[Path] = None, *, environ: Optional[Mapping[str, str]] = None
 ) -> Dict[str, str]:
-    """Local 127.0.0.1 relay keys. Precedence: process env > llm_gateway/.env > .env.bailian_openai."""
+    """Local relay keys; the dedicated Insurance profile owns its relay key."""
     d = Path(gateway_dir) if gateway_dir else GATEWAY_DIR
     env = os.environ if environ is None else environ
     out: Dict[str, str] = {}
@@ -168,6 +168,9 @@ def load_local_gateway_keys(
             if v:
                 out[name] = v
                 break
+    insurance_key = parse_env_file(d / ".env.insurance_4002").get("LITELLM_MASTER_KEY", "").strip()
+    if insurance_key:
+        out["INSURANCE_LITELLM_MASTER_KEY"] = insurance_key
     return out
 
 

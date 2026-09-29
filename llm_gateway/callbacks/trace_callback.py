@@ -320,6 +320,66 @@ def _attribution_snapshot(messages: Any, kwargs: dict) -> tuple[dict[str, Any], 
 
 
 class EvalTraceLogger(CustomLogger):
+    def log_stream_event(self, kwargs, response_obj, start_time, end_time):
+        """Persist the first non-whitespace text/thinking chunk; tools do not count.
+
+        kwargs belongs to this LiteLLM call, so concurrent cases share no timer.
+        end_time is the chunk arrival time, not delayed callback execution time.
+        """
+        data = _safe(response_obj)
+        if not isinstance(data, dict):
+            return
+        kind = None
+        def has_text(value):
+            return isinstance(value, str) and bool(value.strip())
+
+        choices = data.get("choices") or []
+        delta = (choices[0].get("delta") or {}) if choices else (data.get("delta") or {})
+        if isinstance(delta, dict):
+            if has_text(delta.get("content")) or has_text(delta.get("text")):
+                kind = "text"
+            elif has_text(delta.get("reasoning_content")) or has_text(delta.get("thinking")):
+                kind = "thinking"
+        if data.get("type") in ("response.output_text.delta", "response.reasoning_summary_text.delta", "response.reasoning_text.delta") and has_text(delta):
+            kind = "text" if data["type"] == "response.output_text.delta" else "thinking"
+        block = data.get("content_block") or data.get("item") or {}
+        if isinstance(block, dict):
+            if block.get("type") == "text" and has_text(block.get("text")):
+                kind = "text"
+            elif block.get("type") == "thinking" and has_text(block.get("thinking")):
+                kind = "thinking"
+        if kind is None:
+            return
+        at = end_time.timestamp() if isinstance(end_time, datetime) else time.time()
+        t0 = kwargs.get("_eval_trace_t0")
+        if t0 is None or at < t0:
+            return
+        previous = kwargs.get("_eval_first_frame_at")
+        if previous is not None and previous <= at:
+            return
+        kwargs["_eval_first_frame_at"] = at
+        _append({
+            "event": "first_frame", "ts": _now(),
+            "call_id": kwargs.get("_eval_trace_call_id") or kwargs.get("litellm_call_id"),
+            **(kwargs.get("_eval_attribution") or {}),
+            "first_frame_at": datetime.fromtimestamp(at, timezone.utc).isoformat(),
+            "first_frame_ms": round((at - t0) * 1000),
+            "first_frame_kind": kind,
+        })
+
+    async def async_log_stream_event(self, kwargs, response_obj, start_time, end_time):
+        self.log_stream_event(kwargs, response_obj, start_time, end_time)
+
+    async def async_post_call_streaming_iterator_hook(self, user_api_key_dict, response, request_data):
+        # Current LiteLLM async streams log only their completed response. Observe
+        # chunks at the proxy iterator as well; the SDK stream hook alone misses them.
+        logging_obj = getattr(response, "logging_obj", None) or request_data.get("litellm_logging_obj")
+        async for chunk in response:
+            details = getattr(logging_obj, "model_call_details", {})
+            if details.get("_eval_first_frame_at") is None:
+                self.log_stream_event(details, chunk, None, datetime.now(timezone.utc))
+            yield chunk
+
 
     async def async_pre_call_hook(self, user_api_key_dict, cache, data, call_type):
         """Thinking-at-relay: default OFF; opt-in via X-Eval-Thinking: on or *-think model."""

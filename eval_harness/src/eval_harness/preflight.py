@@ -59,15 +59,24 @@ PREFLIGHT_CASE_ID = "__preflight__"
 MCP_SERVER = "insurance-tools"
 PROBE_TOOL = {"tool": "customer_search", "arguments": {"query": "伏云平"}}  # dataset A01 customer
 INSURANCE_HEALTH_URL = "http://127.0.0.1:18063/health"
-INSURANCE_GATEWAY_BASE = "http://127.0.0.1:4002/v1"
+INSURANCE_RELAY_PROFILE = PROJECT_ROOT / "llm_gateway" / ".env.insurance_4002"
 INSURANCE_MODEL_ENV = "EVAL_PREFLIGHT_INSURANCE_MODEL"
 INSURANCE_DEFAULT_MODEL = "deepseek-v4-flash-0731"
 # Pi models.json (~/.pi/agent/models.json, JSON5) provider → base URL; key env from agent_env.
 PI_PROVIDER_BASE = {
     "local-relay": "http://127.0.0.1:4001/v1",
-    "local-relay-bailian": "http://127.0.0.1:4002/v1",
+    "local-relay-bailian": None,  # resolved from the dedicated relay profile
 }
 MCP_STEP_TIMEOUT_S = 90.0
+
+
+def _insurance_gateway_base() -> str:
+    profile = ae.parse_env_file(INSURANCE_RELAY_PROFILE)
+    host = profile.get("LITELLM_HOST")
+    port = profile.get("LITELLM_PORT")
+    if not host or not port:
+        raise ValueError(f"Insurance relay host/port missing in {INSURANCE_RELAY_PROFILE}")
+    return f"http://{host}:{port}/v1"
 
 
 class PreflightFailed(SystemExit):
@@ -296,13 +305,13 @@ def check_gateway(spec: HarnessSpec) -> Dict[str, Any]:
     else:
         if spec.kind == "pi":
             provider = str(spec.provider or "")
-            base = PI_PROVIDER_BASE.get(provider)
+            base = _insurance_gateway_base() if provider == "local-relay-bailian" else PI_PROVIDER_BASE.get(provider)
             key_name = ae.PI_PROVIDER_KEY_ENV.get(provider)
             if not base or not key_name:
                 return {"ok": False, "error": f"unknown Pi provider {provider!r} (known: {sorted(PI_PROVIDER_BASE)})"}
             model = spec.model or INSURANCE_DEFAULT_MODEL
         else:
-            base, key_name = INSURANCE_GATEWAY_BASE, "INSURANCE_LITELLM_MASTER_KEY"
+            base, key_name = _insurance_gateway_base(), "INSURANCE_LITELLM_MASTER_KEY"
             model = os.environ.get(INSURANCE_MODEL_ENV) or INSURANCE_DEFAULT_MODEL
         token = ae.load_local_gateway_keys().get(key_name, "")
         url = f"{base}/chat/completions"

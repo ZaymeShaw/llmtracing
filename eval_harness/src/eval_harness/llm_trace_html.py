@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from eval_harness.protocol_trace import request_fields, response_fields, usage_fields
 from eval_harness.trace_store import identity_key, identity_start, read_identity
+from eval_harness.wire_turns import observed_turns
 
 import html
 import json
@@ -620,6 +621,7 @@ def _normalize_call(raw: dict[str, Any]) -> dict[str, Any]:
         "latency_ms": raw.get("latency_ms") or resp.get("latency_ms"),
         "ts_start": ts_start,
         "ts_end": ts_end,
+        **{k: raw.get(k, resp.get(k)) for k in ("first_frame_ms", "first_frame_kind", "first_frame_at")},
         "status_code": raw.get("status_code"),
         "error": raw.get("error"),
         "system": system,
@@ -736,22 +738,9 @@ def _wire_only_overview(case_dir: Path, calls: list[dict[str, Any]]) -> dict[str
                 thinking_present = True
                 break
 
-    # prompt = first user-ish message across calls; final = last non-empty assistant
-    prompt = ""
-    for c in normalized:
-        for m in c.get("messages") or []:
-            if isinstance(m, dict) and m.get("role") == "user" and (m.get("text") or "").strip():
-                prompt = m["text"]
-                break
-        if prompt:
-            break
-    final_text = ""
-    for c in reversed(normalized):
-        if (c.get("assistant") or "").strip():
-            final_text = c["assistant"]
-            break
-
-    turns = [{"index": 1, "prompt": prompt, "final_text": final_text}] if (prompt or final_text or normalized) else []
+    turns, main_calls, other_conversations = observed_turns(normalized)
+    prompt = turns[0]["prompt"] if turns else ""
+    final_text = turns[-1]["final_text"] if turns else ""
 
     meta = _load_runner_case_meta(case_dir)
     success = meta.get("success")
@@ -766,7 +755,7 @@ def _wire_only_overview(case_dir: Path, calls: list[dict[str, Any]]) -> dict[str
         if not (final_text or "").strip() or str(final_text).strip().startswith("{"):
             final_text = ans
             if turns:
-                turns[0]["final_text"] = ans
+                turns[-1]["final_text"] = ans
             else:
                 turns = [{"index": 1, "prompt": prompt, "final_text": ans}]
     http_status = meta.get("http_status")
@@ -781,6 +770,9 @@ def _wire_only_overview(case_dir: Path, calls: list[dict[str, Any]]) -> dict[str
         exit_code = 1
 
     note_bits = ["无 harness Trace；整案总览由中转 llm_calls 合成（wire-only）"]
+    note_bits.append("turn 按请求中的用户消息历史还原；工具结果不另计一轮。首字按正文或 thinking 的首个非空白文字片段计，纯工具调用不计；中转从主会话首次上游调用前计时，跨工具调用等待至文字出现，不含 harness 启动和浏览器渲染；旧日志未采集时无法补算")
+    if other_conversations:
+        note_bits.append(f"总览展示调用最多的会话；另有 {other_conversations} 条独立会话，全部保留在调用明细中")
     if meta:
         note_bits.append("已合并 runner cases 元数据（answer/wall/success）")
     artifacts = {"llm_calls": "llm_calls.jsonl"}
@@ -795,6 +787,7 @@ def _wire_only_overview(case_dir: Path, calls: list[dict[str, Any]]) -> dict[str
         "available": True,
         "wire_only": True,
         "execution_metadata": bool(meta),
+        "main_call_ids": [c.get("call_id") for c in main_calls],
         "case_id": case_dir.name,
         "success": success,
         "exit_code": exit_code,
@@ -805,7 +798,7 @@ def _wire_only_overview(case_dir: Path, calls: list[dict[str, Any]]) -> dict[str
             "api_ms": int(sum(latencies)) if latencies else None,
             "first_frame_ms": first_frame_ms,
             "first_frame_kind": first_frame_kind,
-            "num_turns": None,
+            "num_turns": len(turns),
             "num_tool_calls": len(tool_timeline),
             "num_llm_calls": len(normalized),
             "thinking_present": thinking_present,
@@ -1032,10 +1025,10 @@ def _infer_first_frame(case_dir: Path, calls: list[dict[str, Any]], overview: di
     Priority:
     1) Trace metrics already set
     2) Claude stream-jsonl result.ttft_ms (+ kind from first assistant text/tool_use)
-    3) Wire llm_calls: elapsed from case start to first call that returns tool_calls or assistant text
+    3) Captured gateway first-content timestamp, relative to the main conversation start
     """
     metrics = overview.get("metrics") if isinstance(overview.get("metrics"), dict) else {}
-    if metrics.get("first_frame_ms") is not None:
+    if metrics.get("first_frame_ms") is not None and metrics.get("first_frame_kind") in ("text", "thinking"):
         return metrics.get("first_frame_ms"), metrics.get("first_frame_kind")
 
     # Claude Code stream sibling: cases/<id>.jsonl
@@ -1084,43 +1077,42 @@ def _infer_first_frame(case_dir: Path, calls: list[dict[str, Any]], overview: di
                                 break
         except Exception:
             pass
-        if ttft is not None:
-            return ttft, kind or "text"
+        if ttft is not None and kind in ("text", "thinking"):
+            return ttft, kind
 
-    # Wire llm_calls: first visible assistant action from case t0
-    if calls:
-        def _parse_ts(v: Any) -> Optional[float]:
-            if not v or not isinstance(v, str):
-                return None
+    # Only measured stream timing counts; response completion is not a first frame.
+    main_ids = overview.get("main_call_ids")
+    main = [c for c in calls if main_ids is None or c.get("call_id") in main_ids]
+    if main:
+        from datetime import datetime
+
+        def seconds(value):
             try:
-                from datetime import datetime
-                return datetime.fromisoformat(v.replace("Z", "+00:00")).timestamp()
-            except Exception:
+                return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+            except (AttributeError, TypeError, ValueError):
                 return None
 
-        t0s = [_parse_ts(c.get("ts_start")) for c in calls]
-        t0s = [t for t in t0s if t is not None]
-        if t0s:
-            t0 = min(t0s)
-            for c in calls:
-                has_tools = bool(c.get("tool_calls"))
-                has_text = bool((c.get("assistant") or "").strip())
-                has_thinking = bool((c.get("thinking") or "").strip())
-                if not (has_tools or has_text or has_thinking):
-                    continue
-                ts = _parse_ts(c.get("ts_end"))
-                if ts is None:
-                    ts = _parse_ts(c.get("ts_start"))
-                    lat = c.get("latency_ms")
-                    if ts is not None and isinstance(lat, (int, float)):
-                        ts = ts + float(lat) / 1000.0
-                if ts is None:
-                    continue
-                ms = int(max(0.0, (ts - t0) * 1000))
-                if has_tools:
-                    return ms, "tool_use"
-                return ms, "text"
+        start = seconds(main[0].get("ts_start"))
+        for call in main:
+            measured = call.get("first_frame_ms")
+            kind = call.get("first_frame_kind")
+            if kind in ("text", "thinking") and isinstance(measured, (int, float)) and measured >= 0:
+                if call is main[0]:
+                    return round(measured), kind
+                at = seconds(call.get("first_frame_at"))
+                call_start = seconds(call.get("ts_start"))
+                if at is None and call_start is not None:
+                    at = call_start + measured / 1000
+                if start is not None and at is not None and at >= start:
+                    return round((at - start) * 1000), kind
+                return None, None
+            # Older logs may have text but only a tool timestamp. A later call's
+            # text must not masquerade as this execution's first character.
+            if (call.get("assistant") or "").strip() or (call.get("thinking") or "").strip():
+                return None, None
+
     return None, None
+
 
 
 def _enrich_overview(overview: dict[str, Any], calls: list[dict[str, Any]], case_dir: Path) -> dict[str, Any]:
@@ -1141,10 +1133,9 @@ def _enrich_overview(overview: dict[str, Any], calls: list[dict[str, Any]], case
                 n += len(c.get("tool_calls") or [])
             metrics["num_tool_calls"] = n
 
-    ff_ms, ff_kind = (None, None) if overview.get("wire_only") else _infer_first_frame(case_dir, calls, overview)
-    if ff_ms is not None:
-        metrics["first_frame_ms"] = ff_ms
-        metrics["first_frame_kind"] = ff_kind
+    ff_ms, ff_kind = _infer_first_frame(case_dir, calls, overview)
+    metrics["first_frame_ms"] = ff_ms
+    metrics["first_frame_kind"] = ff_kind
 
     # Claude stream-jsonl result: authoritative wall/api/ttft/turns when present
     stream = None
@@ -1206,7 +1197,7 @@ def _enrich_overview(overview: dict[str, Any], calls: list[dict[str, Any]], case
                             # keep looking for a shorter user question inside
                             continue
             t0["prompt"] = prompt or t0.get("prompt") or ""
-        if not (t0.get("final_text") or "").strip():
+        if not overview.get("wire_only") and not (t0.get("final_text") or "").strip():
             for c in reversed(calls):
                 if (c.get("assistant") or "").strip():
                     t0["final_text"] = c["assistant"]
@@ -1600,13 +1591,23 @@ function renderCases(filter = '') {{
     }};
     caseList.appendChild(li);
   }}
-  DATA.cases.forEach((c, i) => {{
+  // Execution directories are hashes; display logical case IDs in natural order.
+  const ordered = DATA.cases.map((c, i) => ({{ c, i }})).sort((a, b) => {{
+    for (const key of ['run_id', 'harness', 'case_id']) {{
+      const cmp = String((a.c.identity || {{}})[key] || '').localeCompare(
+        String((b.c.identity || {{}})[key] || ''), undefined, {{ numeric: true }});
+      if (cmp) return cmp;
+    }}
+    return (b.c.attempt || 0) - (a.c.attempt || 0);
+  }});
+  ordered.forEach(({{ c, i }}) => {{
     if (!visibleCases().includes(c)) return;
     if (q && !caseLabel(c).toLowerCase().includes(q)) return;
     const li = document.createElement('li');
     li.dataset.i = i;
     if (i === caseIdx) li.classList.add('active');
-    li.innerHTML = `<strong>${{esc(caseLabel(c))}}</strong><span class="meta">${{c.n_calls}} calls${{c.latest && c.attempt > 1 ? " · 最新" : ""}} · ${{esc(c.preview)}}</span>`;
+    const turns = ((c.overview || {{}}).turns || []).length;
+    li.innerHTML = `<strong>${{esc(caseLabel(c))}}</strong><span class="meta">${{turns ? turns + ' 轮 · ' : ''}}${{c.n_calls}} calls${{c.latest && c.attempt > 1 ? " · 最新" : ""}} · ${{esc(c.preview)}}</span>`;
     li.onclick = () => {{
       caseIdx = i; callIdx = -1;
       location.hash = DATA.cases[i].id + '/overview';
@@ -1700,7 +1701,7 @@ function renderOverview(c) {{
   let ctxHtml = `<div class="stats">
     <div><div class="k">${{ov.wire_only && !ov.execution_metadata ? "模型调用跨度 ms" : "wall_ms"}}</div><div class="v">${{tok(ov.wire_only && !ov.execution_metadata ? m.model_span_ms : m.wall_ms)}}</div></div>
     <div><div class="k">api_ms</div><div class="v">${{tok(m.api_ms)}}</div></div>
-    <div><div class="k">first_frame_ms</div><div class="v">${{tok(m.first_frame_ms)}}${{m.first_frame_kind ? ' (' + esc(m.first_frame_kind) + ')' : ''}}</div></div>
+    <div title="正文或 thinking 的首个非空白文字片段；纯工具调用不算。${{ov.wire_only ? '从主会话首次上游调用前计时，包含文字出现前的工具等待；测量点在中转，不是浏览器渲染。' : '从 harness 调用前计时，到 CLI 输出文字事件；测量点在 CLI，不是浏览器渲染。'}}"><div class="k">首字耗时 ms${{ov.wire_only ? " · 中转" : " · harness"}}</div><div class="v">${{m.first_frame_ms == null ? "未采集" : tok(m.first_frame_ms)}}${{m.first_frame_kind ? ' (' + esc(m.first_frame_kind) + ')' : ''}}</div></div>
     <div><div class="k">num_turns</div><div class="v">${{tok(m.num_turns)}}</div></div>
     <div><div class="k">num_tool_calls</div><div class="v">${{tok(m.num_tool_calls)}}</div></div>
     <div><div class="k">num_llm_calls</div><div class="v">${{tok(m.num_llm_calls ?? c.n_calls)}}</div></div>
@@ -1716,8 +1717,8 @@ function renderOverview(c) {{
     ctxHtml += '<div class="empty">无 turns（缺 prompt/final）</div>';
   }} else {{
     turns.forEach(t => {{
-      ctxHtml += `<div class="msg"><div class="role">${{ov.wire_only && !ov.execution_metadata ? "首个观测输入" : "turn " + esc(t.index) + " · 输入 prompt"}}</div><pre>${{esc(t.prompt || '')}}</pre></div>`;
-      ctxHtml += `<div class="msg assistant"><div class="role">${{ov.wire_only && !ov.execution_metadata ? "最后模型回复" : "turn " + esc(t.index) + " · 输出 final_text"}}</div><pre>${{esc(t.final_text || '')}}</pre></div>`;
+      ctxHtml += `<div class="msg"><div class="role">${{"turn " + esc(t.index) + " · 输入 prompt"}}</div><pre>${{esc(t.prompt || '')}}</pre></div>`;
+      ctxHtml += `<div class="msg assistant"><div class="role">${{"turn " + esc(t.index) + " · 输出 final_text"}}</div><pre>${{esc(t.final_text || '')}}</pre></div>`;
     }});
   }}
   const evs = ov.events || [];
@@ -1741,7 +1742,7 @@ function renderOverview(c) {{
   ctx.innerHTML = ctxHtml;
 
   reply.innerHTML = turns.length
-    ? turns.map(t => `<div class="msg assistant"><div class="role">${{ov.wire_only && !ov.execution_metadata ? "最后模型回复" : "turn " + esc(t.index) + " final"}}</div><pre>${{esc(t.final_text || '')}}</pre></div>`).join('')
+    ? turns.map(t => `<div class="msg assistant"><div class="role">${{"turn " + esc(t.index) + " final"}}</div><pre>${{esc(t.final_text || '')}}</pre></div>`).join('')
     : '<div class="empty">无最终输出</div>';
 
   const tl = ov.tool_timeline || [];

@@ -76,6 +76,7 @@ def test_run_case_success_false_when_stream_has_error_message(tmp_path: Path):
             turns=["hi"],
             case_dir=case_dir,
             project_cwd=tmp_path,
+            agent_workdir_root=str(tmp_path / "sandbox"),
             timeout_sec=5,
         )
     assert result.success is False
@@ -111,6 +112,7 @@ def test_run_case_success_true_without_stream_error(tmp_path: Path):
             turns=["hi"],
             case_dir=case_dir,
             project_cwd=tmp_path,
+            agent_workdir_root=str(tmp_path / "sandbox"),
             timeout_sec=5,
         )
     assert result.success is True

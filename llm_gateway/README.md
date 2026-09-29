@@ -8,8 +8,11 @@
 | `.env.penguin` | Named copy of the current penguin/anthropic upstream |
 | `.env.aliyun_maas` | Aliyun MaaS **Anthropic** (`…/apps/anthropic`, `deepseek-v4-flash-0731`) — use for Claude |
 | `.env.aliyun_maas_openai` | Aliyun MaaS OpenAI-compatible (`…/compatible-mode/v1`) — Insurance-only / chat experiments |
+| `.env.insurance_4002` | Dedicated Insurance/Pi relay on port 4002; its port, local key, LiteLLM YAML and log directory are explicit |
+| `.env.opencode_4003` | OpenCode test relay on port 4003; also records the OpenCode executable, sandbox and dataset paths |
 
 Secrets live only in `.env` / `.env.*` (gitignored). Do **not** overwrite `.env` when adding a new upstream — add `.env.<name>` instead.
+The dedicated relay profiles are local files because they contain credentials. To change a relay, edit its profile and restart that relay; launchers do not replace its port, key or log directory at runtime.
 
 | Var | Meaning |
 |---|---|
@@ -37,3 +40,5 @@ Secrets live only in `.env` / `.env.*` (gitignored). Do **not** overwrite `.env`
 ```
 
 Active profile is recorded in `run/active_profile`. Switching profiles forces a restart even if port 4001 looks healthy.
+
+The Insurance launcher reads `.env.insurance_4002` by default: `./start_insurance_litellm.sh`. For a second relay, use `./start_litellm.sh --profile opencode_4003 --foreground`; foreground mode does not touch the background listener on port 4001.
