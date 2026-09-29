@@ -1,7 +1,7 @@
 ---
 name: claude-code-eval-harness
 description: >-
-  Batch-run mock_system Dataset Bundle cases through Claude Code CLI, capture
+  Batch-run llmtracing Dataset Bundle cases through Claude Code CLI, capture
   full Traces (thinking, tools, multi-turn, timing, first-frame), write
   results.xlsx + per-case JSON. Use when evaluating Claude Code on insurance
   mock tools or regenerating eval_runs. No scoring. Scripts only read standard
@@ -23,7 +23,7 @@ Markdown/xlsx/飞书 layouts are **not** runner input. Import them into a Bundle
 ## When to use
 
 - Eval / smoke / batch-run Claude Code on the 120-题 set
-- Need traces for tool-calling / multi-turn under `mock_system`
+- Need traces for tool-calling / multi-turn under `llmtracing`
 - New dataset format → write/adjust importer, regenerate Bundle, schema-validate
 - New harness CLI dialect → adjust adapter mapping into Trace kinds
 

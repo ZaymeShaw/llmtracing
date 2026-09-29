@@ -7,4 +7,4 @@ Ownership moved to the insurance side:
 - Eval-branch tool: `/Users/xiaozijian/WorkSpace/package/insurance_qa_agent/scripts/insurance_eval_branch.py`
 - Full README: `/Users/xiaozijian/WorkSpace/package/insurance_qa_agent/scripts/insurance_eval_branch.README.md`
 
-This `mock_system/scripts/` copy is a thin shim that `runpy`s the insurance-side script so existing paths keep working.
+This `llmtracing/scripts/` copy is a thin shim that `runpy`s the insurance-side script so existing paths keep working.

@@ -1,11 +1,11 @@
-# mock_system
+# llmtracing
 
 用于批量评测 Claude Code、Pi、Insurance QA 等 harness，记录模型与工具调用，生成轨迹、Excel 和 HTML 报告。
 
 ## 目录
 
 ```text
-mock_system/
+llmtracing/
 ├── eval_harness/                    # 评测框架
 │   ├── src/eval_harness/
 │   │   ├── adapters/                # harness 接入实现

@@ -7,7 +7,7 @@
 先认这几个位置。`myrelay / my_agent / my_batch` 是示例名；标“新建”的文件由你准备，其余工具已提供，日志和报告自动生成。命令均在仓库根目录执行。
 
 ```text
-mock_system/
+llmtracing/
 ├── llm_gateway/                         # 两种模式共用的 LiteLLM 中转
 │   ├── .env.example                    # 中转配置样例
 │   ├── .env.myrelay                    # 复制后填写：上游、端口、密钥、日志目录

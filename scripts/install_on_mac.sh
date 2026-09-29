@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install eval_harness into mock_system on the Mac.
+# Install eval_harness into llmtracing on the Mac.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 TARGET="${1:-$SCRIPT_DIR}"

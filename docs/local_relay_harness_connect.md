@@ -48,10 +48,10 @@
 
 ### 3.2 自研 OpenAI 兼容 Agent（如 insurance_qa_agent / Agno）
 
-**mock_system 薄 adapter（不改保险仓库，用于实测）：**
+**llmtracing 薄 adapter（不改保险仓库，用于实测）：**
 
 ```bash
-cd /Users/xiaozijian/WorkSpace/package/mock_system/eval_harness
+cd /Users/xiaozijian/WorkSpace/package/llmtracing/eval_harness
 PYTHONPATH=src \
   /Users/xiaozijian/WorkSpace/package/insurance_qa_agent/insurance-qa-agent/.feval_venv/bin/python \
   -m eval_harness.adapters.insurance --case-id INS_SMOKE_001
@@ -83,7 +83,7 @@ apply_openai_compatible_case_id(model, case_id)
    下面的 `--from-gateway-log` **仅限 debug / 切片排查**，不是产品路径：
 
 ```bash
-cd /Users/xiaozijian/WorkSpace/package/mock_system/eval_harness
+cd /Users/xiaozijian/WorkSpace/package/llmtracing/eval_harness
 PYTHONPATH=src python3 -m eval_harness.llm_trace_html \
   --from-gateway-log ../llm_gateway/logs/llm_calls.jsonl \
   --out-run-dir ../eval_runs/wire_insurance_demo \

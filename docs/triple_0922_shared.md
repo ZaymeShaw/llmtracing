@@ -11,7 +11,7 @@
 ## 怎么跑
 
 ```bash
-cd /Users/xiaozijian/WorkSpace/package/mock_system
+cd /Users/xiaozijian/WorkSpace/package/llmtracing
 # 推荐包装脚本
 ./scripts/run_triple_0922.sh A01,C20
 

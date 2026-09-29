@@ -24,7 +24,7 @@
 ## 命令
 
 ```bash
-cd /Users/xiaozijian/WorkSpace/package/mock_system/eval_harness
+cd /Users/xiaozijian/WorkSpace/package/llmtracing/eval_harness
 PYTHONPATH=src python3 -m eval_harness.suite \
   --bundle bundles/120_prompt_only_v1.jsonl \
   --cases A01,A02
@@ -33,7 +33,7 @@ PYTHONPATH=src python3 -m eval_harness.suite \
 或：
 
 ```bash
-/Users/xiaozijian/WorkSpace/package/mock_system/scripts/run_dual_dataset_a.sh A01,A02
+/Users/xiaozijian/WorkSpace/package/llmtracing/scripts/run_dual_dataset_a.sh A01,A02
 ```
 
 行为摘要：
