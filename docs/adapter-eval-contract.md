@@ -19,6 +19,15 @@ Related: [local_relay_harness_connect.md](local_relay_harness_connect.md),
    - Preferred headers (gateway already extracts these):
      - `X-Eval-Case-Id`
      - `X-Eval-Execution-Id`
+   - W3C equivalents (for harnesses with OpenTelemetry):
+     `traceparent: 00-<execution_id as 32 hex>-<span>-01` and
+     `baggage: eval.execution_id=…,eval.case_id=…,eval.run_id=…` (percent-encoded).
+     execution_id precedence: `X-Eval-Execution-Id` > body metadata >
+     baggage `eval.execution_id` > traceparent trace-id. Baggage outranks
+     traceparent because OTel HTTP client instrumentation can re-root
+     traceparent while forwarding baggage; a disagreement is kept as a
+     `case_id_warnings` entry. Records carry `execution_id_source` and the
+     inbound `trace_id`. The Insurance adapter sends both forms.
    - Documented equivalents also accepted where the gateway already looks
      (e.g. body / `metadata.eval_case_id`, `metadata.eval_execution_id`;
      Claude text marker `<!--eval_case_id:…-->` for case only).
@@ -30,6 +39,9 @@ Related: [local_relay_harness_connect.md](local_relay_harness_connect.md),
    - When **both** headers (or equivalents) are present, the gateway treats
      attribution as **explicit** and **skips the lane registry**.
    - Lane is a **fallback only** when ids are incomplete (e.g. case-only).
+   - A lane is one named gateway (`.env.<name>` with `LANE_POOL`); the runner
+     leases it per case, so N business instances ↔ N gateways need no
+     business-side headers. See `llm_gateway/README.md` (Named gateways and lanes).
 
 4. **Thinking-at-relay (P1 — implemented)**
    - Default **OFF** at the local relay (`:4001` / `:4002`).

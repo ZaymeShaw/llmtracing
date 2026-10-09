@@ -50,7 +50,9 @@ def test_moved_profiles_resolve_in_another_checkout_and_cwd(checkout, name, caps
         assert Path(cfg["project_cwd"]) == checkout / "workspaces" / name
         assert cfg["harness_bin"] == name
     else:
-        assert cfg["_adapter_options"]["gateway_log"] == checkout / "llm_gateway/logs/llm_calls.jsonl"
+        # Lane mode: paths derive from llm_gateway/.env.<name>, not from the profile.
+        assert cfg["_adapter_options"]["lanes"] == "insurance"
+        assert "gateway_log" not in cfg["_adapter_options"]
     assert run.main(["--config", str(config), "--all", "--dry-parse"]) == 0
     assert "total=1" in capsys.readouterr().out
     assert not (checkout / "eval_runs").exists()
@@ -125,7 +127,8 @@ def test_insurance_uses_common_entrypoint_and_preserves_batch_options(checkout, 
     assert calls[0]["resume"] is True
     assert calls[0]["eval_runs_dir"] == checkout / "eval_runs"
     assert calls[0]["chat_url"] == "http://127.0.0.1:18063/v1/chat"
-    assert calls[0]["attribution_config"] == checkout / "llm_gateway/attribution_lanes.json"
+    assert calls[0]["lanes"] == "insurance"
+    assert "attribution_config" not in calls[0]
     assert "project_cwd" not in calls[0]
 
 

@@ -132,13 +132,13 @@ def test_case_first_character_includes_tool_roundtrip_and_rejects_legacy_timing(
                   first_frame_ms=100, first_frame_kind="tool_use"),
              dict(call_id="answer", ts_start="2026-09-29T00:00:02Z", assistant="hello",
                   first_frame_ms=450, first_frame_kind="text")]
-    assert _infer_first_frame(tmp_path, calls, {}) == (2450, "text")
-    assert _infer_first_frame(tmp_path, calls[:1], {}) == (None, None)
+    assert _infer_first_frame(tmp_path, calls, {}) == (2450, "text", "inferred")
+    assert _infer_first_frame(tmp_path, calls[:1], {}) == (None, None, None)
     # The old collector stopped at a tool delta even if text arrived later.
     calls[0]["assistant"] = "historical text without its timestamp"
-    assert _infer_first_frame(tmp_path, calls, {}) == (None, None)
+    assert _infer_first_frame(tmp_path, calls, {}) == (None, None, None)
     assert _infer_first_frame(tmp_path, [], {"metrics": {
-        "first_frame_ms": 100, "first_frame_kind": "tool_use"}}) == (None, None)
+        "first_frame_ms": 100, "first_frame_kind": "tool_use"}}) == (None, None, None)
 
 
 @pytest.mark.parametrize("kind", ["text", "thinking"])

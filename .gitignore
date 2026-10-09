@@ -16,6 +16,7 @@
 **/*.pyc
 /backups/
 /eval_runs/
+/outputs/
 /eval_harness/data/
 /eval_harness/bundles/
 /var/

@@ -11,7 +11,7 @@ import re
 import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 TZ_SH = timezone(timedelta(hours=8))
 
@@ -32,18 +32,84 @@ def _raw_side(rec: dict[str, Any], *, drop: set[str]) -> dict[str, Any]:
     return {k: v for k, v in rec.items() if k not in drop}
 
 
-def load_gateway_pairs(log_path: Path, *, start_offset: int = 0, strict: bool = False) -> list[dict[str, Any]]:
+LOG_FILE_NAME = "llm_calls.jsonl"
+
+
+def gateway_log_files(log_path: Path) -> list[Path]:
+    """A gateway log file, or every ``llm_calls.jsonl`` under a log directory.
+
+    Directory form covers the legacy shared ``logs/llm_calls.jsonl`` plus the
+    per-gateway ``logs/gateways/<name>/llm_calls.jsonl`` files.
+    """
+    log_path = Path(log_path)
+    if log_path.is_dir():
+        return sorted(p for p in log_path.rglob(LOG_FILE_NAME) if p.is_file())
+    return [log_path]
+
+
+def snapshot_offsets(log_path: Path) -> int | dict[str, int]:
+    """Current end-of-file offset(s): an int for a file, ``{path: size}`` for a directory."""
+    log_path = Path(log_path)
+    if log_path.is_dir():
+        out: dict[str, int] = {}
+        for p in gateway_log_files(log_path):
+            try:
+                out[str(p)] = p.stat().st_size
+            except OSError:
+                continue
+        return out
+    try:
+        return log_path.stat().st_size if log_path.is_file() else 0
+    except OSError:
+        return 0
+
+
+def _read_log_lines(log_path: Path, start_offset: int | dict[str, int]) -> list[tuple[str, int, int, str]]:
+    """(file, offset, line_no, line) for every line after the offset(s)."""
+    log_path = Path(log_path)
+    if log_path.is_dir():
+        offsets = start_offset if isinstance(start_offset, dict) else {}
+        # Files that appeared after the snapshot start from 0; vanished ones were rotated/truncated.
+        missing = [p for p in offsets if not Path(p).is_file()]
+        if missing and any(offsets[p] for p in missing):
+            raise RuntimeError("gateway log was truncated during case execution")
+        targets = [(p, int(offsets.get(str(p), 0))) for p in gateway_log_files(log_path)]
+    else:
+        offset = int(start_offset or 0) if not isinstance(start_offset, dict) else int(start_offset.get(str(log_path), 0))
+        if not log_path.is_file():
+            if offset:
+                raise FileNotFoundError(log_path)
+            return []
+        targets = [(log_path, offset)]
+    out: list[tuple[str, int, int, str]] = []
+    for path, offset in targets:
+        if path.stat().st_size < offset:
+            raise RuntimeError("gateway log was truncated during case execution")
+        with path.open("r", encoding="utf-8") as source:
+            source.seek(offset)
+            lines = source.readlines()
+        out.extend((str(path), offset, n, line) for n, line in enumerate(lines, start=1))
+    return out
+
+
+def load_gateway_pairs(log_path: Path, *, start_offset: int | dict[str, int] = 0,
+                       strict: bool = False) -> list[dict[str, Any]]:
     """Join per-call records from thin-proxy OR LiteLLM callback jsonl.
 
     Thin proxy events: request / response / response_stream / error
     LiteLLM callback events: pre_api_call / success / failure
+
+    ``log_path`` may be one jsonl file or a directory (all ``llm_calls.jsonl``
+    below it; ``start_offset`` is then the dict from ``snapshot_offsets``).
+    call_ids are unique per gateway process, so records are joined across files.
     """
-    if not log_path.is_file():
-        if start_offset:
-            raise FileNotFoundError(log_path)
-        return []
-    if log_path.stat().st_size < start_offset:
-        raise RuntimeError("gateway log was truncated during case execution")
+    lines = _read_log_lines(Path(log_path), start_offset)
+    return pairs_from_lines(lines, strict=strict, sort_by_ts=Path(log_path).is_dir())
+
+
+def pairs_from_lines(lines: Iterable[tuple[str, int, int, str]], *, strict: bool = False,
+                     sort_by_ts: bool = False) -> list[dict[str, Any]]:
+    """Join ``(file, offset, line_no, line)`` gateway records into per-call pairs."""
     by: dict[str, dict[str, Any]] = {}
     order: list[str] = []
 
@@ -53,10 +119,7 @@ def load_gateway_pairs(log_path: Path, *, start_offset: int = 0, strict: bool = 
             order.append(cid)
         return by[cid]
 
-    with log_path.open("r", encoding="utf-8") as source:
-        source.seek(start_offset)
-        lines = source.readlines()
-    for line_no, line in enumerate(lines, start=1):
+    for _file, offset, line_no, line in lines:
         line = line.strip()
         if not line:
             continue
@@ -64,7 +127,7 @@ def load_gateway_pairs(log_path: Path, *, start_offset: int = 0, strict: bool = 
             rec = json.loads(line)
         except json.JSONDecodeError as exc:
             if strict:
-                raise ValueError(f"malformed gateway log line after offset {start_offset}, line {line_no}") from exc
+                raise ValueError(f"malformed gateway log line after offset {offset}, line {line_no}") from exc
             continue
         cid = rec.get("call_id")
         if not cid:
@@ -72,7 +135,9 @@ def load_gateway_pairs(log_path: Path, *, start_offset: int = 0, strict: bool = 
         slot = slot_for(cid)
         if rec.get("case_id") and not slot.get("case_id"):
             slot["case_id"] = rec.get("case_id")
-        for key in ("execution_id", "run_id", "harness", "started_at", "lane_id", "attribution_status", "case_id_source", "thinking_effective", "thinking_source"):
+        for key in ("execution_id", "run_id", "harness", "started_at", "lane_id", "attribution_status", "case_id_source",
+                    "execution_id_source", "trace_id", "thinking_effective", "thinking_source", "gateway",
+                    "project_id", "role", "stage", "verifier_trace_id"):
             if rec.get(key) is not None and slot.get(key) is None:
                 slot[key] = rec[key]
         ev = rec.get("event")
@@ -134,6 +199,10 @@ def load_gateway_pairs(log_path: Path, *, start_offset: int = 0, strict: bool = 
             slot["case_id_source"] = rec.get("case_id_source")
             slot["request"] = _raw_side(rec, drop={"event", "call_id"})
         elif ev == "success":
+            if slot.get("state") == "failed":
+                continue
+            slot["state"] = "succeeded"
+            slot["ended_at"] = rec.get("ts")
             slot["latency_ms"] = rec.get("latency_ms")
             slot["status_code"] = 200
             slot["response"] = _raw_side(rec, drop={"event", "call_id"})
@@ -146,8 +215,12 @@ def load_gateway_pairs(log_path: Path, *, start_offset: int = 0, strict: bool = 
             slot.setdefault("model", rec.get("model"))
             slot.setdefault("ts", rec.get("ts"))
         elif ev == "failure":
+            slot["state"] = "failed"
+            slot["ended_at"] = rec.get("ts")
+            slot["latency_ms"] = rec.get("latency_ms")
             slot["error"] = rec.get("error")
-            slot["status_code"] = slot.get("status_code") or 500
+            # A connection failure may have no HTTP status. Never invent 500.
+            slot["status_code"] = rec.get("status_code")
             if rec.get("protocol"):
                 slot["protocol"] = rec.get("protocol")
             if slot.get("request") is None:
@@ -157,6 +230,9 @@ def load_gateway_pairs(log_path: Path, *, start_offset: int = 0, strict: bool = 
             slot.setdefault("source", "litellm")
             slot.setdefault("ts", rec.get("ts"))
             slot.setdefault("model", rec.get("model"))
+        elif ev == "stream_partial":
+            slot["incomplete"] = True
+            slot["response"] = _raw_side(rec, drop={"event", "call_id"})
         elif ev == "error":
             slot["error"] = rec.get("error")
 
@@ -166,6 +242,9 @@ def load_gateway_pairs(log_path: Path, *, start_offset: int = 0, strict: bool = 
         if "ts" not in slot and "request" not in slot:
             continue
         out.append(slot)
+    if sort_by_ts:
+        # Interleave calls from several gateway files by time (stable; missing ts last).
+        out.sort(key=lambda s: (s.get("ts") is None, str(s.get("ts") or "")))
     return out
 
 
@@ -303,8 +382,13 @@ def pairs_to_trace_calls(pairs: list[dict[str, Any]], *, case_id: str) -> list[d
                 "execution_id": p.get("execution_id"),
                 "run_id": p.get("run_id"),
                 "harness": p.get("harness"),
+                "project_id": p.get("project_id"),
+                "role": p.get("role"),
+                "stage": p.get("stage"),
+                "verifier_trace_id": p.get("verifier_trace_id"),
                 "started_at": p.get("started_at"),
                 "lane_id": p.get("lane_id"),
+                "gateway": p.get("gateway"),
                 "attribution_status": p.get("attribution_status"),
                 "case_id_source": p.get("case_id_source"),
                 "thinking_effective": p.get("thinking_effective"),
@@ -321,6 +405,7 @@ def pairs_to_trace_calls(pairs: list[dict[str, Any]], *, case_id: str) -> list[d
                 "request": req,
                 "response": p.get("response"),
                 "error": p.get("error"),
+                **{k: p.get(k) for k in ("state", "ended_at", "incomplete")},
             }
         )
     return calls

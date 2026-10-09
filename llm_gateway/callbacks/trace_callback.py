@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 import uuid
 from datetime import datetime, timezone
@@ -12,11 +13,16 @@ from typing import Any
 from callbacks.case_id import (
     detect_protocol,
     extract_case_id,
-    extract_execution_id,
     extract_trace_labels,
     proxy_request_bits,
+    resolve_execution_id,
 )
-from callbacks.attribution import load_config as load_lane_config, mark_gateway_ready, resolve as resolve_lane_attribution
+from callbacks.attribution import (
+    lane_mode,
+    load_config as load_lane_config,
+    mark_gateway_ready,
+    resolve as resolve_lane_attribution,
+)
 
 try:
     from litellm.integrations.custom_logger import CustomLogger
@@ -29,32 +35,41 @@ LOG_DIR = Path(os.environ.get("LLM_GATEWAY_LOG_DIR", str(Path(__file__).resolve(
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 LOG_FILE = LOG_DIR / "llm_calls.jsonl"
 _LANE_CONFIG: dict[str, Any] | None = None
-_LANE_CONFIG_PATH: str | None = None
+_LANE_CONFIG_KEY: tuple | None = None
+
+
+def _lane_config_key() -> tuple | None:
+    mode = lane_mode()
+    if mode is None:
+        return None
+    if mode == "json":
+        return (mode, str(Path(os.environ["LLM_ATTRIBUTION_CONFIG"]).resolve()))
+    return (mode, os.environ.get("LLM_GATEWAY_NAME"), os.environ.get("LANE_POOL"),
+            os.environ.get("LANE_REGISTRY_DIR"), os.environ.get("LITELLM_MASTER_KEY"))
 
 
 def _get_lane_config() -> dict[str, Any] | None:
-    """Return attribution config for the *current* LLM_ATTRIBUTION_CONFIG.
+    """Return attribution config for the *current* lane settings (json or env mode).
 
     The production gateway process warms this once at import, but unit tests
-    monkeypatch LLM_ATTRIBUTION_CONFIG after import. Always refresh when the
-    env path changes so lane key hashes stay aligned with the active config.
+    monkeypatch the env after import. Refresh whenever the lane settings change
+    so lane key hashes stay aligned with the active config.
     """
-    global _LANE_CONFIG, _LANE_CONFIG_PATH
-    raw = os.environ.get("LLM_ATTRIBUTION_CONFIG")
-    if not raw:
+    global _LANE_CONFIG, _LANE_CONFIG_KEY
+    key = _lane_config_key()
+    if key is None:
         _LANE_CONFIG = None
-        _LANE_CONFIG_PATH = None
+        _LANE_CONFIG_KEY = None
         return None
-    resolved = str(Path(raw).resolve())
-    if _LANE_CONFIG is not None and _LANE_CONFIG_PATH == resolved:
+    if _LANE_CONFIG is not None and _LANE_CONFIG_KEY == key:
         return _LANE_CONFIG
     _LANE_CONFIG = load_lane_config()
-    _LANE_CONFIG_PATH = resolved
+    _LANE_CONFIG_KEY = key
     return _LANE_CONFIG
 
 
-# Warm cache only for the live gateway worker process.
-if os.environ.get("LLM_ATTRIBUTION_CONFIG") and os.environ.get("LLM_ATTRIBUTION_GATEWAY_PROCESS") == "1":
+# Warm cache only for the live gateway worker process (fail-closed at startup).
+if lane_mode() and os.environ.get("LLM_ATTRIBUTION_GATEWAY_PROCESS") == "1":
     _get_lane_config()
 
 
@@ -128,8 +143,66 @@ def _safe_client_request(body: Any) -> Any:
 
 
 def _append(record: dict) -> None:
+    # Which gateway process wrote this record (set by gatewayctl; None for legacy launchers).
+    name = (os.environ.get("LLM_GATEWAY_NAME") or "").strip()
+    if name and "gateway" not in record:
+        record = {**record, "gateway": name}
     with LOG_FILE.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False, default=lambda o: _jsonable(o)) + "\n")
+
+
+def _failure_details(kwargs: dict, response_obj: Any) -> tuple[dict, int | None]:
+    """Whitelist exception fields; never serialize its request/response internals."""
+    exc = kwargs.get("exception")
+    status = getattr(exc, "status_code", None)
+    if not isinstance(status, int) or isinstance(status, bool) or not 100 <= status <= 599:
+        status = None
+    message = str(exc) if exc is not None else "Gateway request failed (reason unavailable)"
+    if exc is None and isinstance(response_obj, dict):
+        error = response_obj.get("error")
+        if isinstance(error, dict):
+            message = str(error.get("message") or message)
+        elif isinstance(error, str):
+            message = error
+    # Exceptions may echo credentials in messages. Do not log the traceback/body.
+    secrets = [v for k, v in os.environ.items() if any(s in k.upper() for s in
+               ("API_KEY", "MASTER_KEY", "AUTH_TOKEN", "ACCESS_TOKEN", "PASSWORD", "SECRET")) and len(v) >= 4]
+    for params in (kwargs, kwargs.get("litellm_params") or {}):
+        for key in ("api_key", "authorization", "access_token"):
+            value = params.get(key)
+            if isinstance(value, str) and value:
+                secrets.append(value)
+    for secret in sorted(secrets, key=len, reverse=True):
+        message = message.replace(secret, "[REDACTED]")
+    message = re.sub(r"(?i)\bBearer\s+[^\s,;\"']+", "Bearer [REDACTED]", message)
+    return {"type": type(exc).__name__ if exc is not None else "GatewayError",
+            "message": message, "status_code": status}, status
+
+
+def _merge_stream_delta(choices: dict, chunk: dict) -> None:
+    """Retain received Chat Completions text/tools, without inventing a finish."""
+    for choice in chunk.get("choices") or []:
+        index = choice.get("index", 0)
+        target = choices.setdefault(index, {"index": index, "finish_reason": None,
+                                            "message": {"role": "assistant"}})
+        message = target["message"]
+        delta = choice.get("delta") or {}
+        for key in ("content", "reasoning_content"):
+            if isinstance(delta.get(key), str):
+                message[key] = message.get(key, "") + delta[key]
+        for tool in delta.get("tool_calls") or []:
+            tools = message.setdefault("tool_calls", [])
+            idx = tool.get("index", 0)
+            found = next((t for t in tools if t["index"] == idx), None)
+            if found is None:
+                found = {"index": idx, "type": "function", "function": {}}
+                tools.append(found)
+            if tool.get("id"):
+                found["id"] = tool["id"]
+            for key in ("name", "arguments"):
+                value = (tool.get("function") or {}).get(key)
+                if isinstance(value, str):
+                    found["function"][key] = found["function"].get(key, "") + value
 
 
 THINKING_HEADER = "x-eval-thinking"
@@ -172,6 +245,22 @@ def _apply_thinking_policy(data: dict, call_type: str | None) -> str:
     Separate from Insurance upstream models_common_args enable_thinking:false —
     that is the Insurance agent commit; this is relay-side policy for :4001/:4002.
     """
+    if os.environ.get("LLM_GATEWAY_THINKING_POLICY") == "passthrough":
+        # Observer gateways preserve the harness's own reasoning configuration.
+        # OpenAI-compatible transports accept vendor fields via extra_body;
+        # allowing `thinking` as an SDK keyword instead raises TypeError.
+        if (os.environ.get("UPSTREAM_PROTOCOL") == "openai"
+                and str(call_type or "").lower() in ("completion", "acompletion", "chat_completion")
+                and "thinking" in data):
+            extra = data.get("extra_body")
+            if extra is None or isinstance(extra, dict):
+                data["extra_body"] = {**(extra or {}), "thinking": data.pop("thinking")}
+        meta = data.get("metadata")
+        if not isinstance(meta, dict):
+            meta = {}
+            data["metadata"] = meta
+        meta["eval_thinking_policy"] = "passthrough"
+        return "passthrough"
     hdrs = _headers_lower(data)
     optin = _thinking_optin(data, hdrs)
     model = str(data.get("model") or "")
@@ -213,6 +302,16 @@ def _apply_thinking_policy(data: dict, call_type: str | None) -> str:
             policy = "caller"
         else:
             eb["enable_thinking"] = False
+            if os.environ.get("UPSTREAM_PROTOCOL", "").lower() == "anthropic":
+                # OpenAI-format caller (e.g. Pi) on an Anthropic-protocol upstream:
+                # enable_thinking is ignored there, and LiteLLM drops `thinking` for
+                # models it does not list as reasoning-capable unless allowed.
+                data["thinking"] = {"type": "disabled"}
+                allowed = data.get("allowed_openai_params")
+                allowed = list(allowed) if isinstance(allowed, list) else []
+                if "thinking" not in allowed:
+                    allowed.append("thinking")
+                data["allowed_openai_params"] = allowed
             policy = "relay_default_off"
 
     meta = data.get("metadata")
@@ -250,6 +349,10 @@ def _thinking_effective_from_kwargs(optional_params: Any, kwargs: dict) -> tuple
             return "on", source or "caller"
 
     eb = op.get("extra_body") if isinstance(op.get("extra_body"), dict) else {}
+    if isinstance(eb.get("thinking"), dict):
+        t = str(eb["thinking"].get("type") or "").lower()
+        if t in ("enabled", "disabled"):
+            return ("on" if t == "enabled" else "off"), source or "caller"
     if "enable_thinking" in op:
         return ("on" if op.get("enable_thinking") else "off"), source or "caller"
     if "enable_thinking" in eb:
@@ -272,11 +375,12 @@ def _resolve_case_and_protocol(messages: Any, kwargs: dict) -> tuple[str | None,
         optional_params=optional_params,
         messages=messages,
     )
-    execution_id = extract_execution_id(
+    execution_id, _, execution_warnings = resolve_execution_id(
         headers=headers,
         body=body,
         optional_params=optional_params,
     )
+    warnings = warnings + execution_warnings
     protocol = detect_protocol(path=path, body=body if isinstance(body, dict) else None, messages=messages)
     return case_id, source, execution_id, protocol, warnings
 
@@ -285,29 +389,35 @@ def _attribution_snapshot(messages: Any, kwargs: dict) -> tuple[dict[str, Any], 
     """Attribute a request: both case+execution ids win; else lane; else legacy case-only.
 
     - Both case_id and execution_id present → explicit/header-sourced; never consult lane.
-    - Either missing and LLM_ATTRIBUTION_CONFIG set → lane registry (Insurance serial).
-    - No lane config (e.g. Claude :4001) → keep case_id-only explicit tagging.
+    - Either missing and this gateway is a lane (LANE_POOL / legacy LLM_ATTRIBUTION_CONFIG) → lane registry.
+    - Not a lane (e.g. Claude :4001) → keep case_id-only explicit tagging.
     """
     case_id, source, execution_id, protocol, warnings = _resolve_case_and_protocol(messages, kwargs)
     headers, body, _ = proxy_request_bits(kwargs.get("litellm_params") or {})
     labels = extract_trace_labels(headers=headers, body=body, optional_params=kwargs.get("optional_params"))
     if case_id and execution_id:
+        _, execution_source, _ = resolve_execution_id(
+            headers=headers, body=body, optional_params=kwargs.get("optional_params"))
         return (
             {
                 "case_id": case_id,
                 "execution_id": execution_id,
                 **labels,
                 "case_id_source": source,
+                "execution_id_source": execution_source,
                 "attribution_status": "explicit",
             },
             protocol,
             warnings,
         )
-    if os.environ.get("LLM_ATTRIBUTION_CONFIG"):
+    if lane_mode():
         try:
             lane = resolve_lane_attribution(kwargs, config=_get_lane_config())
         except (OSError, ValueError, TypeError, KeyError):
             lane = {"attribution_status": "config_unavailable"}
+        if labels.get("trace_id"):
+            # Inbound W3C trace (not ours to trust for attribution) kept for lookup.
+            lane = {**lane, "trace_id": labels["trace_id"]}
         return lane, protocol, warnings
     if case_id:
         # Claude / non-lane gateways: case tag alone remains explicit.
@@ -317,6 +427,30 @@ def _attribution_snapshot(messages: Any, kwargs: dict) -> tuple[dict[str, Any], 
             warnings,
         )
     return {"case_id": None, "attribution_status": "unmapped"}, protocol, warnings
+
+
+def _omit_empty_tool_delta_identity(chunk):
+    """Omit empty incremental tool ids/names without changing argument fragments.
+
+    Some compatible upstreams/LiteLLM versions emit empty strings after the
+    initial tool identity. DSH treats those as replacements. Copy before
+    changing the outbound representation so LiteLLM's capture stays intact.
+    The proxy serializer excludes None fields on these model objects.
+    """
+    if not hasattr(chunk, "model_copy"):
+        return chunk
+    changed = False
+    result = chunk.model_copy(deep=True)
+    for choice in getattr(result, "choices", []) or []:
+        for call in getattr(getattr(choice, "delta", None), "tool_calls", []) or []:
+            if getattr(call, "id", None) == "":
+                call.id = None
+                changed = True
+            function = getattr(call, "function", None)
+            if function is not None and getattr(function, "name", None) == "":
+                function.name = None
+                changed = True
+    return result if changed else chunk
 
 
 class EvalTraceLogger(CustomLogger):
@@ -374,11 +508,29 @@ class EvalTraceLogger(CustomLogger):
         # Current LiteLLM async streams log only their completed response. Observe
         # chunks at the proxy iterator as well; the SDK stream hook alone misses them.
         logging_obj = getattr(response, "logging_obj", None) or request_data.get("litellm_logging_obj")
-        async for chunk in response:
+        partial_choices: dict = {}
+        try:
+            async for chunk in response:
+                details = getattr(logging_obj, "model_call_details", {})
+                if details.get("_eval_first_frame_at") is None:
+                    self.log_stream_event(details, chunk, None, datetime.now(timezone.utc))
+                data = _safe(chunk)
+                if isinstance(data, dict):
+                    _merge_stream_delta(partial_choices, data)
+                if os.environ.get("LLM_GATEWAY_OMIT_EMPTY_TOOL_DELTAS") == "1":
+                    chunk = _omit_empty_tool_delta_identity(chunk)
+                yield chunk
+        except Exception:
+            # Separate from the async failure hook, whose scheduling can race
+            # with this iterator. Import accepts these records in either order.
             details = getattr(logging_obj, "model_call_details", {})
-            if details.get("_eval_first_frame_at") is None:
-                self.log_stream_event(details, chunk, None, datetime.now(timezone.utc))
-            yield chunk
+            if partial_choices:
+                _append({"event": "stream_partial", "ts": _now(),
+                         "call_id": details.get("_eval_trace_call_id") or details.get("litellm_call_id"),
+                         **(details.get("_eval_attribution") or {}),
+                         "response": {"choices": list(partial_choices.values())},
+                         "incomplete": True})
+            raise
 
 
     async def async_pre_call_hook(self, user_api_key_dict, cache, data, call_type):
@@ -467,6 +619,12 @@ class EvalTraceLogger(CustomLogger):
 
     async def async_log_failure_event(self, kwargs, response_obj, start_time, end_time):
         call_id = kwargs.get("_eval_trace_call_id") or kwargs.get("litellm_call_id") or str(uuid.uuid4())
+        error, status_code = _failure_details(kwargs, response_obj)
+        latency_ms = None
+        if isinstance(start_time, datetime) and isinstance(end_time, datetime):
+            latency_ms = max(0, round((end_time - start_time).total_seconds() * 1000))
+        elif kwargs.get("_eval_trace_t0") is not None:
+            latency_ms = max(0, round((time.time() - kwargs["_eval_trace_t0"]) * 1000))
         messages = kwargs.get("messages")
         attribution = kwargs.get("_eval_attribution")
         if not isinstance(attribution, dict):
@@ -485,14 +643,16 @@ class EvalTraceLogger(CustomLogger):
             "protocol": protocol,
             "model": kwargs.get("model"),
             "messages": _safe(messages),
-            "error": _safe(response_obj),
+            "error": error,
+            "status_code": status_code,
+            "latency_ms": latency_ms,
         }
         if warnings:
             rec["case_id_warnings"] = warnings
         _append(rec)
 
 
-if os.environ.get("LLM_ATTRIBUTION_CONFIG") and os.environ.get("LLM_ATTRIBUTION_GATEWAY_PROCESS") == "1":
+if lane_mode() and os.environ.get("LLM_ATTRIBUTION_GATEWAY_PROCESS") == "1":
     mark_gateway_ready()
 
 proxy_handler_instance = EvalTraceLogger()

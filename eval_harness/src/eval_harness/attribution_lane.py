@@ -170,15 +170,26 @@ def recover_blocked_lane(directory: Path, lane_id: str, execution_id: str) -> No
 
 def main() -> None:
     import argparse
-    parser = argparse.ArgumentParser(description="Recover a blocked Insurance attribution lane after its old work has stopped")
-    parser.add_argument("--config", type=Path, required=True)
-    parser.add_argument("--lane", required=True)
-    parser.add_argument("--chat-url", required=True)
+    parser = argparse.ArgumentParser(description="Recover a blocked attribution lane after its old work has stopped")
+    parser.add_argument("--gateway", help="lane gateway name (.env.<name> with LANE_POOL)")
+    parser.add_argument("--config", type=Path, help="legacy attribution_lanes.json")
+    parser.add_argument("--lane", help="legacy lane id (with --config)")
+    parser.add_argument("--chat-url", help="legacy chat_url (with --config)")
     parser.add_argument("--execution-id", required=True)
     args = parser.parse_args()
-    directory, _ = lane_config(args.config, args.lane, args.chat_url)
-    recover_blocked_lane(directory, args.lane, args.execution_id)
-    print(f"recovered {args.lane} after {args.execution_id}")
+    if args.gateway:
+        from eval_harness.gateways import resolve_lanes
+        spec = next((s for s in resolve_lanes(args.gateway) if s.name == args.gateway), None)
+        if spec is None:
+            raise SystemExit(f"{args.gateway} is not a lane gateway")
+        directory, lane_id = spec.registry_dir, spec.name
+    elif args.config and args.lane and args.chat_url:
+        directory, _ = lane_config(args.config, args.lane, args.chat_url)
+        lane_id = args.lane
+    else:
+        raise SystemExit("pass --gateway NAME, or legacy --config/--lane/--chat-url")
+    recover_blocked_lane(directory, lane_id, args.execution_id)
+    print(f"recovered {lane_id} after {args.execution_id}")
 
 
 if __name__ == "__main__":

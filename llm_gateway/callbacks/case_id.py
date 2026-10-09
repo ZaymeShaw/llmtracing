@@ -3,7 +3,13 @@
 Priority:
   1. Header X-Eval-Case-Id
   2. Structured body: eval_case_id (+ Responses metadata.eval_case_id)
-  3. Text marker <!--eval_case_id:…-->
+  3. W3C baggage ``eval.case_id``
+  4. Text marker <!--eval_case_id:…-->
+
+execution_id: X-Eval-Execution-Id > body metadata > baggage ``eval.execution_id``
+> W3C traceparent trace-id. Baggage outranks traceparent because OTel HTTP
+client instrumentation rewrites traceparent (new span, possibly a new trace when
+the server side did not continue the inbound context) but forwards baggage.
 
 No filesystem / process fallback. Conflicts: higher priority wins; return warn note.
 """
@@ -11,9 +17,14 @@ from __future__ import annotations
 
 import re
 from typing import Any
+from urllib.parse import unquote
 
 CASE_HEADER = "x-eval-case-id"
 EXECUTION_HEADER = "x-eval-execution-id"
+TRACEPARENT_HEADER = "traceparent"
+BAGGAGE_HEADER = "baggage"
+_TRACEPARENT_RE = re.compile(r"^([0-9a-f]{2})-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$")
+_MAX_BAGGAGE = 8192  # W3C baggage limit
 _CASE_MARKER_RE = re.compile(r"<!--\s*eval_case_id:([A-Za-z0-9_.-]+)\s*-->")
 _CASE_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 _EXECUTION_ID_RE = re.compile(r"^[A-Za-z0-9_.:/-]+$")
@@ -87,6 +98,43 @@ def _texts_from_input(inp: Any) -> list[str]:
     return out
 
 
+def _header(headers: Any, name: str) -> str | None:
+    if not isinstance(headers, dict):
+        return None
+    for k, v in headers.items():
+        if str(k).lower() == name:
+            return v if isinstance(v, str) else (None if v is None else str(v))
+    return None
+
+
+def trace_id_from_traceparent(headers: Any) -> str | None:
+    """W3C trace-id (32 lowercase hex, not all zero) from a valid ``traceparent``."""
+    raw = _header(headers, TRACEPARENT_HEADER)
+    m = _TRACEPARENT_RE.match(raw.strip()) if raw else None
+    if not m or m.group(1) == "ff" or set(m.group(2)) == {"0"} or set(m.group(3)) == {"0"}:
+        return None
+    return m.group(2)
+
+
+def baggage_entries(headers: Any) -> dict[str, str]:
+    """``eval.*`` members of a W3C ``baggage`` header (percent-decoded, properties dropped)."""
+    raw = _header(headers, BAGGAGE_HEADER)
+    if not raw or len(raw) > _MAX_BAGGAGE:
+        return {}
+    out: dict[str, str] = {}
+    for member in raw.split(","):
+        key, sep, value = member.split(";", 1)[0].partition("=")
+        key = key.strip()
+        if sep and key.startswith("eval.") and key not in out:
+            out[key] = unquote(value.strip())
+    return out
+
+
+def _valid_execution_id(value: Any) -> str | None:
+    val = value.strip() if isinstance(value, str) else None
+    return val if val and len(val) <= 256 and _EXECUTION_ID_RE.match(val) else None
+
+
 def _from_header(headers: Any) -> str | None:
     if not isinstance(headers, dict):
         return None
@@ -108,25 +156,39 @@ def _from_header_execution_id(headers: Any) -> str | None:
     return None
 
 
+def resolve_execution_id(
+    *,
+    headers: Any = None,
+    body: Any = None,
+    optional_params: Any = None,
+) -> tuple[str | None, str | None, list[str]]:
+    """Return (execution_id, source, warnings); source ∈ {header, body, baggage, traceparent, None}."""
+    candidates: list[tuple[str, str | None]] = [("header", _from_header_execution_id(headers))]
+    meta_id = None
+    for source in (body, optional_params):
+        meta = source.get("metadata") if isinstance(source, dict) else None
+        if isinstance(meta, dict):
+            meta_id = meta_id or _valid_execution_id(meta.get("eval_execution_id"))
+    candidates.append(("body", meta_id))
+    candidates.append(("baggage", _valid_execution_id(baggage_entries(headers).get("eval.execution_id"))))
+    candidates.append(("traceparent", trace_id_from_traceparent(headers)))
+    present = [(s, v) for s, v in candidates if v]
+    if not present:
+        return None, None, []
+    source, winner = present[0]
+    warnings = [f"execution_id conflict: keeping {source}={winner}, ignoring {s}={v}"
+                for s, v in present[1:] if v != winner]
+    return winner, source, warnings
+
+
 def extract_execution_id(
     *,
     headers: Any = None,
     body: Any = None,
     optional_params: Any = None,
 ) -> str | None:
-    """Return execution_id from headers or body metadata."""
-    eid = _from_header_execution_id(headers)
-    if eid:
-        return eid
-    # Also check body.metadata.eval_execution_id
-    for source in (body, optional_params):
-        if isinstance(source, dict):
-            meta = source.get("metadata")
-            if isinstance(meta, dict):
-                val = meta.get("eval_execution_id")
-                if isinstance(val, str) and val.strip() and _EXECUTION_ID_RE.match(val.strip()):
-                    return val.strip()
-    return None
+    """Return execution_id from headers, body metadata, baggage or traceparent."""
+    return resolve_execution_id(headers=headers, body=body, optional_params=optional_params)[0]
 
 
 def _from_body_fields(body: Any) -> str | None:
@@ -185,7 +247,7 @@ def extract_case_id(
 ) -> tuple[str | None, str | None, list[str]]:
     """Return (case_id, source, warnings).
 
-    source ∈ {header, body, optional_params, text, None}
+    source ∈ {header, body, optional_params, baggage, text, None}
     """
     warnings: list[str] = []
     header_id = _from_header(headers)
@@ -194,11 +256,13 @@ def extract_case_id(
     # body and optional_params are the same semantic tier (structured field)
     structured_id = body_id or opt_id
     structured_source = "body" if body_id else ("optional_params" if opt_id else None)
+    baggage_id = _norm(baggage_entries(headers).get("eval.case_id"))
     text_id = _from_text_marker(messages=messages, optional_params=optional_params, body=body)
 
     present = [(s, v) for s, v in (
         ("header", header_id),
         ("structured", structured_id),
+        ("baggage", baggage_id),
         ("text", text_id),
     ) if v]
     if not present:
@@ -274,10 +338,17 @@ def proxy_request_bits(litellm_params: Any) -> tuple[Any, Any, Any]:
 
 
 def extract_trace_labels(*, headers=None, body=None, optional_params=None):
-    """Batch/harness labels are routing metadata, independent of model protocol."""
+    """Batch/harness labels are routing metadata, independent of model protocol.
+
+    Also records the inbound W3C ``trace_id`` (when a valid traceparent is present)
+    so consumers can look calls up by it even when execution_id came from elsewhere.
+    """
     result = {}
     lowered = {str(k).lower(): v for k, v in (headers or {}).items()} if isinstance(headers, dict) else {}
-    for field, header in (("run_id", "x-eval-run-id"), ("harness", "x-eval-harness"), ("started_at", "x-eval-started-at")):
+    baggage = baggage_entries(headers)
+    for field, header in (("run_id", "x-eval-run-id"), ("harness", "x-eval-harness"), ("started_at", "x-eval-started-at"),
+                          ("project_id", "x-eval-project-id"), ("role", "x-eval-role"),
+                          ("stage", "x-eval-stage"), ("verifier_trace_id", "x-eval-verifier-trace-id")):
         value = lowered.get(header)
         if not value:
             for source in (body, optional_params):
@@ -286,6 +357,11 @@ def extract_trace_labels(*, headers=None, body=None, optional_params=None):
                     value = source.get("eval_" + field) or (meta.get("eval_" + field) if isinstance(meta, dict) else None)
                     if value:
                         break
+        if not value:
+            value = baggage.get("eval." + field)
         if isinstance(value, str) and 0 < len(value) <= 256 and not any(c in value for c in "\r\n"):
             result[field] = value
+    trace_id = trace_id_from_traceparent(headers)
+    if trace_id:
+        result["trace_id"] = trace_id
     return result

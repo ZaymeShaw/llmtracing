@@ -76,6 +76,9 @@ echo "loaded env: $ENV_FILE"
 
 export UPSTREAM_LITELLM_MODEL="${UPSTREAM_PROTOCOL}/${UPSTREAM_MODEL}"
 export ANTHROPIC_API_KEY="$UPSTREAM_API_KEY"
+# LiteLLM 1.74.8's aiohttp transport swallows truncated chunked responses.
+# Its supported httpx transport propagates the error instead of emitting DONE.
+export DISABLE_AIOHTTP_TRANSPORT="${DISABLE_AIOHTTP_TRANSPORT:-True}"
 
 # Proxy bypass for Aliyun upstreams. On macOS Python/aiohttp/httpx fall back to the *system*
 # proxy (scutil: 127.0.0.1:7890) when no proxy env is set; a flaky/stopped local proxy caused
@@ -146,84 +149,9 @@ if [[ "$FOREGROUND" -eq 1 ]]; then
   exec litellm --config "$CFG" --host "$LITELLM_HOST" --port "$LITELLM_PORT" --telemetry False
 fi
 
-if [[ "$LITELLM_PORT" != "4001" ]]; then
-  echo "background launcher owns :4001; use --foreground for configured port $LITELLM_PORT" >&2
-  exit 1
-fi
-
-healthy=0
-if curl -fsS -m 2 "http://${LITELLM_HOST}:${LITELLM_PORT}/v1/models" \
-    -H "Authorization: Bearer ${LITELLM_MASTER_KEY}" >/dev/null 2>&1; then
-  healthy=1
-fi
-
-if [[ "$healthy" -eq 1 && "$FORCE_RESTART" -eq 0 ]]; then
-  sync_claude_if_requested
-  if [[ -n "${LLM_ATTRIBUTION_CONFIG:-}" ]] && ! python3 - "$LLM_ATTRIBUTION_CONFIG" "$DIR/run/litellm.pid" <<'PY'
-import hashlib, json, pathlib, sys
-try:
-    cfg = pathlib.Path(sys.argv[1]).resolve()
-    config = json.loads(cfg.read_text())
-    port = __import__("os").environ.get("LITELLM_PORT", "4001")
-    marker_path = (cfg.parent / config.get("registry_dir", "run/attribution") / f"gateway_ready.port-{port}.json").resolve()
-    marker = json.loads(marker_path.read_text())
-    pid = int(pathlib.Path(sys.argv[2]).read_text())
-    assert marker["pid"] == pid
-    assert marker["config_path"] == str(cfg)
-    assert marker["config_sha256"] == hashlib.sha256(cfg.read_bytes()).hexdigest()
-except (OSError, ValueError, KeyError, AssertionError):
-    sys.exit(1)
-PY
-  then
-    FORCE_RESTART=1
-    echo "attribution callback not ready on current listener; restarting"
-  fi
-fi
-
-if [[ "$healthy" -eq 1 && "$FORCE_RESTART" -eq 0 ]]; then
-  echo "litellm already healthy on http://${LITELLM_HOST}:${LITELLM_PORT} (profile=$NEW_PROFILE)"
-  echo "$NEW_PROFILE" >"$ACTIVE_FILE"
-  echo "$ENV_FILE" >"$DIR/run/active_env_file"
-  echo "$PROFILE_SHA256" >"$DIR/run/active_env_sha256"
-  exit 0
-fi
-
-# stop leftovers
-if [[ -f "$DIR/run/litellm.pid" ]]; then
-  old="$(cat "$DIR/run/litellm.pid" || true)"
-  if [[ -n "${old:-}" ]] && kill -0 "$old" 2>/dev/null; then
-    echo "stopping litellm pid=$old"
-    if ! kill "$old" 2>/dev/null; then
-      echo "cannot stop litellm pid=$old; leaving current gateway and artifacts unchanged" >&2
-      exit 1
-    fi
-    kill -- -"$old" 2>/dev/null || true
-    sleep 1
-  fi
-  rm -f "$DIR/run/litellm.pid"
-fi
-if command -v lsof >/dev/null 2>&1; then
-  for p in $(lsof -nP -iTCP:"$LITELLM_PORT" -sTCP:LISTEN -t 2>/dev/null || true); do
-    echo "killing leftover listener pid=$p on :$LITELLM_PORT"
-    if ! kill "$p" 2>/dev/null; then
-      echo "cannot stop listener pid=$p; leaving diagnostic log unchanged" >&2
-      exit 1
-    fi
-  done
-  sleep 1
-  if lsof -nP -iTCP:"$LITELLM_PORT" -sTCP:LISTEN -t 2>/dev/null | grep -q .; then
-    echo "listener still owns :$LITELLM_PORT; refusing to truncate diagnostic log" >&2
-    exit 1
-  fi
-fi
-
+# Background mode is a compatibility wrapper: gatewayctl owns pid/log/state.
+# Prefer: llmtrace gateway up <name>  (this wrapper keeps the old "take over the port" behaviour).
 sync_claude_if_requested
-: >"$DIR/logs/litellm.stdout.log"
-
-python3 "$DIR/_detach_litellm.py"
-
-echo "$NEW_PROFILE" >"$ACTIVE_FILE"
-echo "$ENV_FILE" >"$DIR/run/active_env_file"
-echo "$PROFILE_SHA256" >"$DIR/run/active_env_sha256"
-echo "started profile=$NEW_PROFILE"
-echo "upstream=$UPSTREAM_API_BASE protocol=$UPSTREAM_PROTOCOL model=$UPSTREAM_MODEL litellm_model=$UPSTREAM_LITELLM_MODEL"
+UP_ARGS=(up "$NEW_PROFILE" --force)
+[[ "$FORCE_RESTART" -eq 1 ]] && UP_ARGS+=(--restart)
+exec python3 "$DIR/gatewayctl.py" "${UP_ARGS[@]}"

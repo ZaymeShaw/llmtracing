@@ -4,7 +4,9 @@ from __future__ import annotations
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime, timezone
+import hashlib
 import json
+import re
 from pathlib import Path
 import shutil
 import uuid
@@ -59,6 +61,28 @@ def trace_headers(*, run_id=None, harness=None, case_id=None, execution_id=None)
         if value and any(c in str(value) for c in "\r\n"):
             raise ValueError("Trace identity cannot contain newlines")
     return {k: str(v) for k, v in values.items() if v}
+
+
+_HEX32 = re.compile(r"^[0-9a-f]{32}$")
+
+
+def w3c_trace_headers(*, execution_id: str, case_id=None, run_id=None) -> dict[str, str]:
+    """W3C ``traceparent`` + ``baggage`` carrying the same identity as the X-Eval-* headers.
+
+    trace-id is the execution id (uuid4 hex already has the right shape; anything else
+    is hashed). Baggage repeats ``eval.execution_id`` because OTel HTTP client
+    instrumentation may re-root traceparent but forwards baggage unchanged.
+    """
+    from urllib.parse import quote
+    eid = str(execution_id)
+    trace_id = eid if _HEX32.match(eid) and set(eid) != {"0"} else hashlib.sha256(eid.encode()).hexdigest()[:32]
+    span_id = uuid.uuid4().hex[:16]
+    members = [("eval.execution_id", eid), ("eval.case_id", case_id), ("eval.run_id", run_id)]
+    baggage = ",".join(f"{k}={quote(str(v), safe='')}" for k, v in members if v)
+    for value in (eid, baggage):
+        if any(c in value for c in "\r\n"):
+            raise ValueError("Trace identity cannot contain newlines")
+    return {"traceparent": f"00-{trace_id}-{span_id}-01", "baggage": baggage}
 
 
 @contextmanager

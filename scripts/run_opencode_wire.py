@@ -17,9 +17,34 @@ import shutil
 import signal
 import subprocess
 import time
+import threading
 import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
+STOP = threading.Event()
+ACTIVE_LOCK = threading.RLock()
+ACTIVE = set()
+
+
+def stop_children(signum, frame):
+    STOP.set()
+    with ACTIVE_LOCK:
+        active = tuple(ACTIVE)
+        for proc in active:
+            if proc.poll() is None:
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+    deadline = time.monotonic() + 5
+    for proc in active:
+        try:
+            proc.wait(timeout=max(0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
 
 
 def env_file(path):
@@ -39,10 +64,12 @@ def write_json(path, value):
 
 
 def run_case(case, args, relay, mcp):
+    if STOP.is_set():
+        return {'case_id': case['case_id'], 'success': False, 'error': 'batch interrupted'}
     started = datetime.now(timezone.utc).isoformat()
     eid = uuid.uuid4().hex
     cid = case['case_id']
-    output = ROOT / 'eval_runs' / args.run_id / 'cli' / cid / eid
+    output = args.output_root / 'cli' / cid / eid
     sandbox = Path(args.sandbox_root) / args.run_id / cid / eid
     output.mkdir(parents=True)
     sandbox.mkdir(parents=True)
@@ -94,12 +121,18 @@ def run_case(case, args, relay, mcp):
     t0 = time.monotonic()
     try:
         for index, prompt in enumerate(case['turns'], 1):
+            if STOP.is_set():
+                raise RuntimeError('batch interrupted')
             cmd = [args.binary, 'run', '--format', 'json', '--agent', 'insurance_eval']
             if session:
                 cmd += ['--session', session]
             cmd += [prompt]
             with (output / f'turn{index}.jsonl').open('w') as out, (output / f'turn{index}.stderr').open('w') as err:
-                p = subprocess.Popen(cmd, cwd=sandbox, env=child, stdout=out, stderr=err, start_new_session=True)
+                with ACTIVE_LOCK:
+                    if STOP.is_set():
+                        raise RuntimeError('batch interrupted')
+                    p = subprocess.Popen(cmd, cwd=sandbox, env=child, stdout=out, stderr=err, start_new_session=True)
+                    ACTIVE.add(p)
                 try:
                     code = p.wait(timeout=args.timeout)
                 except subprocess.TimeoutExpired:
@@ -110,6 +143,9 @@ def run_case(case, args, relay, mcp):
                         os.killpg(p.pid, signal.SIGKILL)
                         p.wait()
                     raise TimeoutError(f'turn {index} exceeded {args.timeout}s')
+                finally:
+                    with ACTIVE_LOCK:
+                        ACTIVE.discard(p)
             events = []
             for line in (output / f'turn{index}.jsonl').read_text().splitlines():
                 try:
@@ -146,15 +182,37 @@ def run_case(case, args, relay, mcp):
     return status
 
 
+def completed_cases(run_root, run_id, selected):
+    """Resume only selected cases; successes from other subsets do not count."""
+    latest = {}
+    for path in (run_root / 'cli').glob('*/*/status.json'):
+        try:
+            saved = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        cid = saved.get('case_id')
+        if saved.get('run_id') == run_id and cid in selected:
+            if cid not in latest or saved.get('started_at', '') > latest[cid].get('started_at', ''):
+                latest[cid] = saved
+    return {cid for cid, saved in latest.items() if saved.get('success') is True}
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--run-id', required=True)
+    p.add_argument('--out-dir', type=Path, help='CLI artifacts directory; default eval_runs/<run-id>')
     p.add_argument('--cases', help='Comma-separated case IDs; default all 120')
+    p.add_argument('--rerun-cases', default='', help='Retry these selected cases even if the CLI previously succeeded; keeps prior attempts')
     p.add_argument('--concurrency', type=int, default=4)
     p.add_argument('--timeout', type=int, default=600)
     p.add_argument('--minimal-headers', action='store_true', help='Send only batch, case and execution headers')
     p.add_argument('--relay-env', type=Path, required=True, help='LiteLLM profile used to start this relay')
     args = p.parse_args()
+    STOP.clear()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, stop_children)
+    if args.concurrency < 1 or args.timeout <= 0:
+        p.error('concurrency and timeout must be positive')
     relay_path = args.relay_env.resolve()
     if not relay_path.is_file():
         p.error(f'relay profile missing: {relay_path}')
@@ -184,15 +242,13 @@ def main():
             p.error('unknown case IDs')
     mcp = json.loads(args.mcp_config.read_text())['mcpServers']['insurance-tools']
     print(f'relay profile={relay_path} url={args.base_url} log_dir={relay["LLM_GATEWAY_LOG_DIR"]}', flush=True)
-    run_root = ROOT / 'eval_runs' / args.run_id
-    completed = set()
-    for path in (run_root / 'cli').glob('*/*/status.json'):
-        try:
-            saved = json.loads(path.read_text())
-        except (OSError, ValueError):
-            continue
-        if saved.get('run_id') == args.run_id and saved.get('success') is True:
-            completed.add(saved.get('case_id'))
+    run_root = (args.out_dir or ROOT / 'eval_runs' / args.run_id).resolve()
+    args.output_root = run_root
+    completed = completed_cases(run_root, args.run_id, {c['case_id'] for c in cases})
+    retry = set(filter(None, args.rerun_cases.split(',')))
+    if not retry <= {c['case_id'] for c in cases}:
+        p.error('--rerun-cases must be a subset of selected cases')
+    completed -= retry
     pending = [case for case in cases if case['case_id'] not in completed]
     print(f'run_id={args.run_id} total={len(cases)} already_ok={len(completed)} pending={len(pending)}', flush=True)
     results = []
@@ -202,7 +258,7 @@ def main():
     summary = dict(run_id=args.run_id, n_cases=len(cases), n_ok=len(completed) + sum(r['success'] for r in results),
                    n_attempted=len(results), n_skipped=len(completed),
                    executions=[{k:r.get(k) for k in ('case_id','execution_id','success','error')} for r in results])
-    write_json(ROOT / 'eval_runs' / args.run_id / f'batch_{uuid.uuid4().hex[:8]}.json', summary)
+    write_json(run_root / f'batch_{uuid.uuid4().hex[:8]}.json', summary)
     print(json.dumps({key: summary[key] for key in ('run_id', 'n_cases', 'n_ok')}, ensure_ascii=False), flush=True)
     return 0 if summary['n_ok'] == summary['n_cases'] else 1
 

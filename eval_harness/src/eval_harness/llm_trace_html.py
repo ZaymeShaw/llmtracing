@@ -610,12 +610,12 @@ def _normalize_call(raw: dict[str, Any]) -> dict[str, Any]:
     )
 
     ts_start = raw.get("ts") or req.get("ts")
-    ts_end = resp.get("ts")
+    ts_end = raw.get("ended_at") or resp.get("ts")
     tools_brief = _tools_brief(fields["tools"])
     return {
         "seq": raw.get("seq"),
         "call_id": raw.get("call_id"),
-        **{key: raw[key] for key in ("execution_id", "run_id", "harness", "lane_id", "attribution_status") if raw.get(key) is not None},
+        **{key: raw[key] for key in ("execution_id", "run_id", "harness", "lane_id", "gateway", "attribution_status") if raw.get(key) is not None},
         "protocol": raw.get("protocol") or req.get("protocol") or resp.get("protocol"),
         "model": raw.get("model") or req.get("model"),
         "latency_ms": raw.get("latency_ms") or resp.get("latency_ms"),
@@ -624,6 +624,8 @@ def _normalize_call(raw: dict[str, Any]) -> dict[str, Any]:
         **{k: raw.get(k, resp.get(k)) for k in ("first_frame_ms", "first_frame_kind", "first_frame_at")},
         "status_code": raw.get("status_code"),
         "error": raw.get("error"),
+        "state": raw.get("state"),
+        "incomplete": bool(raw.get("incomplete")),
         "system": system,
         "messages": msgs,
         "tool_names": names,
@@ -685,6 +687,21 @@ def _tool_timeline_from_calls(calls: list[dict[str, Any]]) -> list[str]:
     return names
 
 
+# Provenance of overview metrics. "harness" = measured by the harness/adapter
+# itself (CLI output, business HTTP response, runner timing). "inferred" =
+# reconstructed from gateway llm_calls, which only approximates what the user
+# saw (business post-processing after the gateway is invisible). "mixed" = some
+# turns of each. None = not captured.
+HARNESS = "harness"
+INFERRED = "inferred"
+MIXED = "mixed"
+_PROVENANCE_KEYS = ("final_text", "first_frame_ms", "wall_ms", "success")
+
+
+def _provenance(**sources: Optional[str]) -> dict[str, Optional[str]]:
+    return {key: sources.get(key) for key in _PROVENANCE_KEYS}
+
+
 def _wire_only_overview(case_dir: Path, calls: list[dict[str, Any]]) -> dict[str, Any]:
     """Synthesize case overview from llm_calls when trace.json is absent."""
     normalized = [_normalize_call(c) for c in calls]
@@ -741,6 +758,8 @@ def _wire_only_overview(case_dir: Path, calls: list[dict[str, Any]]) -> dict[str
     turns, main_calls, other_conversations = observed_turns(normalized)
     prompt = turns[0]["prompt"] if turns else ""
     final_text = turns[-1]["final_text"] if turns else ""
+    # Default: answers are each turn's last observed model reply (gateway inference).
+    final_source = INFERRED if any((t.get("final_text") or "").strip() for t in turns) else None
 
     meta = _load_runner_case_meta(case_dir)
     success = meta.get("success")
@@ -758,6 +777,8 @@ def _wire_only_overview(case_dir: Path, calls: list[dict[str, Any]]) -> dict[str
                 turns[-1]["final_text"] = ans
             else:
                 turns = [{"index": 1, "prompt": prompt, "final_text": ans}]
+            # Only the last turn now carries the runner's answer; earlier turns stay inferred.
+            final_source = HARNESS if len(turns) == 1 else MIXED
     http_status = meta.get("http_status")
     if success is None and http_status is not None:
         try:
@@ -810,6 +831,12 @@ def _wire_only_overview(case_dir: Path, calls: list[dict[str, Any]]) -> dict[str
         "n_events": len(wire_events),
         "events": _slim_events(wire_events, limit=200),
         "note": "；".join(note_bits),
+        "provenance": _provenance(
+            final_text=final_source,
+            # Without runner wall time the UI shows the model-call span instead: inferred.
+            wall_ms=HARNESS if meta_wall is not None else (INFERRED if wall_ms is not None else None),
+            success=HARNESS if success is not None else None,
+        ),
     }
 
 
@@ -863,6 +890,11 @@ def _load_case_overview(case_dir: Path, *, calls: list[dict[str, Any]] | None = 
                 })
                 overview["note"] += "；业务输入输出来自 Insurance 评测器产物"
                 overview["attribution_status"] = meta.get("attribution_status")
+                overview["provenance"].update(
+                    final_text=HARNESS if any(t["final_text"] for t in overview["turns"]) else None,
+                    wall_ms=HARNESS if meta.get("wall_ms") is not None else None,
+                    success=HARNESS if meta.get("success") is not None else None,
+                )
             return overview
         # Insurance already persists the business request/response in its
         # runner artifacts. Show that existing evidence for zero-LLM cases;
@@ -897,6 +929,11 @@ def _load_case_overview(case_dir: Path, *, calls: list[dict[str, Any]] | None = 
                     "events": [],
                     "note": "业务输入输出来自 Insurance 评测器产物；未观测到 LLM 调用，不能据此断言没有调用",
                     "attribution_status": meta.get("attribution_status"),
+                    "provenance": _provenance(
+                        final_text=HARNESS if any(t["final_text"] for t in turns) else None,
+                        wall_ms=HARNESS if meta.get("wall_ms") is not None else None,
+                        success=HARNESS if meta.get("success") is not None else None,
+                    ),
             }
         return {"available": False, "error": "无 trace.json 且无 llm_calls.jsonl"}
     try:
@@ -919,6 +956,10 @@ def _load_case_overview(case_dir: Path, *, calls: list[dict[str, Any]] | None = 
             overview["note"] = overview["note"].replace(
                 "无 harness Trace；整案总览由中转 llm_calls 合成（wire-only）",
                 "Adapter 提供执行状态；各轮对话和模型指标由中转 llm_calls 还原")
+            overview["provenance"].update(
+                wall_ms=HARNESS if overview["metrics"]["wall_ms"] is not None else None,
+                success=HARNESS if overview["success"] is not None else None,
+            )
             return overview
 
     metrics_src = trace.get("metrics") if isinstance(trace.get("metrics"), dict) else {}
@@ -974,6 +1015,12 @@ def _load_case_overview(case_dir: Path, *, calls: list[dict[str, Any]] | None = 
         "artifacts": trace.get("artifacts"),
         "n_events": len(events) if isinstance(events, list) else 0,
         "events": _slim_events(events, limit=200),
+        "provenance": _provenance(
+            final_text=HARNESS if any(t["final_text"] for t in turns_out) else None,
+            wall_ms=HARNESS if metrics.get("wall_ms") is not None else None,
+            success=HARNESS if trace.get("success") is not None else None,
+            first_frame_ms=HARNESS if metrics.get("first_frame_ms") is not None else None,
+        ),
     }
 
 
@@ -1036,17 +1083,18 @@ def _prompt_from_calls(calls: list[dict[str, Any]]) -> str:
 
 
 
-def _infer_first_frame(case_dir: Path, calls: list[dict[str, Any]], overview: dict[str, Any]) -> tuple[Optional[int], Optional[str]]:
+def _infer_first_frame(case_dir: Path, calls: list[dict[str, Any]], overview: dict[str, Any]) -> tuple[Optional[int], Optional[str], Optional[str]]:
     """Fill first_frame from real run artifacts (same meaning as Trace: first client-visible action).
 
+    Returns (ms, kind, provenance).
     Priority:
-    1) Trace metrics already set
-    2) Claude stream-jsonl result.ttft_ms (+ kind from first assistant text/tool_use)
-    3) Captured gateway first-content timestamp, relative to the main conversation start
+    1) Trace metrics already set                                   -> harness
+    2) Claude stream-jsonl result.ttft_ms (+ kind from first assistant text/tool_use) -> harness
+    3) Captured gateway first-content timestamp, relative to the main conversation start -> inferred
     """
     metrics = overview.get("metrics") if isinstance(overview.get("metrics"), dict) else {}
     if metrics.get("first_frame_ms") is not None and metrics.get("first_frame_kind") in ("text", "thinking"):
-        return metrics.get("first_frame_ms"), metrics.get("first_frame_kind")
+        return metrics.get("first_frame_ms"), metrics.get("first_frame_kind"), HARNESS
 
     # Claude Code stream sibling: cases/<id>.jsonl
     stream = None
@@ -1095,7 +1143,7 @@ def _infer_first_frame(case_dir: Path, calls: list[dict[str, Any]], overview: di
         except Exception:
             pass
         if ttft is not None and kind in ("text", "thinking"):
-            return ttft, kind
+            return ttft, kind, HARNESS
 
     # Only measured stream timing counts; response completion is not a first frame.
     main_ids = overview.get("main_call_ids")
@@ -1115,20 +1163,20 @@ def _infer_first_frame(case_dir: Path, calls: list[dict[str, Any]], overview: di
             kind = call.get("first_frame_kind")
             if kind in ("text", "thinking") and isinstance(measured, (int, float)) and measured >= 0:
                 if call is main[0]:
-                    return round(measured), kind
+                    return round(measured), kind, INFERRED
                 at = seconds(call.get("first_frame_at"))
                 call_start = seconds(call.get("ts_start"))
                 if at is None and call_start is not None:
                     at = call_start + measured / 1000
                 if start is not None and at is not None and at >= start:
-                    return round((at - start) * 1000), kind
-                return None, None
+                    return round((at - start) * 1000), kind, INFERRED
+                return None, None, None
             # Older logs may have text but only a tool timestamp. A later call's
             # text must not masquerade as this execution's first character.
             if (call.get("assistant") or "").strip() or (call.get("thinking") or "").strip():
-                return None, None
+                return None, None, None
 
-    return None, None
+    return None, None, None
 
 
 
@@ -1150,9 +1198,11 @@ def _enrich_overview(overview: dict[str, Any], calls: list[dict[str, Any]], case
                 n += len(c.get("tool_calls") or [])
             metrics["num_tool_calls"] = n
 
-    ff_ms, ff_kind = _infer_first_frame(case_dir, calls, overview)
+    provenance = overview.get("provenance") if isinstance(overview.get("provenance"), dict) else _provenance()
+    ff_ms, ff_kind, ff_source = _infer_first_frame(case_dir, calls, overview)
     metrics["first_frame_ms"] = ff_ms
     metrics["first_frame_kind"] = ff_kind
+    provenance["first_frame_ms"] = ff_source
 
     # Claude stream-jsonl result: authoritative wall/api/ttft/turns when present
     stream = None
@@ -1168,6 +1218,7 @@ def _enrich_overview(overview: dict[str, Any], calls: list[dict[str, Any]], case
                     metrics["api_ms"] = int(e["duration_api_ms"])
                 if e.get("duration_ms") is not None:
                     metrics["wall_ms"] = int(e["duration_ms"])
+                    provenance["wall_ms"] = HARNESS
                 if e.get("num_turns") is not None:
                     metrics["num_turns"] = int(e["num_turns"])
                 if e.get("total_cost_usd") is not None and metrics.get("cost_usd") is None:
@@ -1218,6 +1269,7 @@ def _enrich_overview(overview: dict[str, Any], calls: list[dict[str, Any]], case
             for c in reversed(calls):
                 if (c.get("assistant") or "").strip():
                     t0["final_text"] = c["assistant"]
+                    provenance["final_text"] = INFERRED if len(turns) == 1 else MIXED
                     break
             if not (t0.get("final_text") or "").strip():
                 meta = _load_runner_case_meta(case_dir)
@@ -1226,9 +1278,12 @@ def _enrich_overview(overview: dict[str, Any], calls: list[dict[str, Any]], case
                 ans = ans or resp.get("answer")
                 if ans:
                     t0["final_text"] = str(ans)
+                    if provenance.get("final_text") is None:
+                        provenance["final_text"] = HARNESS
         turns[0] = t0
     overview["turns"] = turns
     overview["metrics"] = metrics
+    overview["provenance"] = provenance
     # provenance: prompt is extracted from wire, not authored here
 
     if not overview.get("tool_timeline"):
@@ -1368,6 +1423,10 @@ def build_llm_trace_html(run_dir: Path, *, title: Optional[str] = None) -> Path:
   .list li:hover {{ background: #f3f4f6; }}
   .list li.active {{ background: var(--accent-soft); color: var(--accent); font-weight: 600; }}
   .list .meta {{ display: block; color: var(--muted); font-size: 11px; font-weight: 400; margin-top: 2px; }}
+  .src {{ display: inline-block; font-size: 10px; font-weight: 600; padding: 0 5px; border-radius: 4px; margin-left: 4px; vertical-align: 1px; }}
+  .src.harness {{ background: #dcfce7; color: #166534; }}
+  .src.inferred, .src.mixed {{ background: #fef3c7; color: #92400e; }}
+  .src.none {{ background: #f1f5f9; color: #64748b; }}
   .detail {{ display: flex; flex-direction: column; min-width: 0; }}
   .tabs {{
     display: flex; gap: 4px; padding: 10px 14px; border-bottom: 1px solid var(--line);
@@ -1491,6 +1550,19 @@ runMeta.textContent = DATA.run_id + ' · ' + visibleCases().length + ' / ' + DAT
 
 function esc(s) {{
   return String(s ?? '').replace(/[&<>"']/g, c => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]));
+}}
+
+// Provenance badge: 真实 = harness/adapter 自己采集；推测 = 从中转 llm_calls 还原。
+const SRC_LABEL = {{harness: '真实', inferred: '推测', mixed: '部分推测'}};
+const SRC_TITLE = {{
+  harness: '由 harness/adapter 直接采集（CLI 输出、业务 HTTP 返回、runner 计时）',
+  inferred: '由中转 llm_calls 推测还原：只看到模型调用，看不到业务在网关之后的处理（拼接/模板/兜底），可能与用户实际看到的不同',
+  mixed: '最后一轮来自 harness，其余轮由中转 llm_calls 推测',
+}};
+function srcBadge(ov, key) {{
+  const s = ((ov && ov.provenance) || {{}})[key];
+  if (!s) return '<span class="src none" title="未采集">未采集</span>';
+  return `<span class="src ${{esc(s)}}" title="${{esc(SRC_TITLE[s] || s)}}">${{esc(SRC_LABEL[s] || s)}}</span>`;
 }}
 
 
@@ -1654,7 +1726,7 @@ function renderCalls() {{
   const m = (c.overview && c.overview.metrics) || {{}};
   const ok = c.overview && c.overview.success;
   const okLabel = ok === true ? 'OK' : (ok === false ? 'FAIL' : '—');
-  ovLi.innerHTML = `<strong>整案总览</strong><span class="meta">${{okLabel}} · wall=${{m.wall_ms != null ? m.wall_ms + 'ms' : '—'}} · first=${{m.first_frame_ms != null ? m.first_frame_ms + 'ms' : '—'}} · llm=${{m.num_llm_calls ?? c.n_calls}}</span>`;
+  ovLi.innerHTML = `<strong>整案总览</strong><span class="meta">${{okLabel}} · wall=${{m.wall_ms != null ? m.wall_ms + 'ms' : '—'}} · first=${{m.first_frame_ms != null ? m.first_frame_ms + 'ms' + (((c.overview || {{}}).provenance || {{}}).first_frame_ms === 'inferred' ? '(推测)' : '') : '—'}} · llm=${{m.num_llm_calls ?? c.n_calls}}</span>`;
   ovLi.onclick = () => {{ callIdx = -1; location.hash = c.id + '/overview'; renderCalls(); renderDetail(); }};
   callList.appendChild(ovLi);
 
@@ -1708,17 +1780,19 @@ function renderOverview(c) {{
       : '<span style="color:#64748b">—</span>');
   bar.innerHTML = `<strong>${{esc(caseLabel(c))}}</strong> · 整案总览 · `
     + statusHtml
+    + srcBadge(ov, 'success')
     + (ov.wire_only && !ov.execution_metadata ? " · 模型调用观测（执行状态未上报）" : "")
     + ` · exit=${{ov.exit_code == null ? '—' : esc(ov.exit_code)}}`
     + ` · wall=${{tok(m.wall_ms)}}ms · api=${{tok(m.api_ms)}}ms`
     + ` · first_frame=${{tok(m.first_frame_ms)}}ms`
     + (m.first_frame_kind ? ` (${{esc(m.first_frame_kind)}})` : '')
+    + srcBadge(ov, 'first_frame_ms')
     + ` · llm=${{tok(m.num_llm_calls ?? c.n_calls)}} · tools=${{tok(m.num_tool_calls)}}`;
 
   let ctxHtml = `<div class="stats">
-    <div><div class="k">${{ov.wire_only && !ov.execution_metadata ? "模型调用跨度 ms" : "wall_ms"}}</div><div class="v">${{tok(ov.wire_only && !ov.execution_metadata ? m.model_span_ms : m.wall_ms)}}</div></div>
+    <div><div class="k">${{ov.wire_only && !ov.execution_metadata ? "模型调用跨度 ms" : "wall_ms"}}${{srcBadge(ov, 'wall_ms')}}</div><div class="v">${{tok(ov.wire_only && !ov.execution_metadata ? m.model_span_ms : m.wall_ms)}}</div></div>
     <div><div class="k">api_ms</div><div class="v">${{tok(m.api_ms)}}</div></div>
-    <div title="正文或 thinking 的首个非空白文字片段；纯工具调用不算。${{ov.wire_only ? '从主会话首次上游调用前计时，包含文字出现前的工具等待；测量点在中转，不是浏览器渲染。' : '从 harness 调用前计时，到 CLI 输出文字事件；测量点在 CLI，不是浏览器渲染。'}}"><div class="k">首字耗时 ms${{ov.wire_only ? " · 中转" : " · harness"}}</div><div class="v">${{m.first_frame_ms == null ? "未采集" : tok(m.first_frame_ms)}}${{m.first_frame_kind ? ' (' + esc(m.first_frame_kind) + ')' : ''}}</div></div>
+    <div title="正文或 thinking 的首个非空白文字片段；纯工具调用不算。${{((ov.provenance || {{}}).first_frame_ms) === 'inferred' ? '从主会话首次上游调用前计时，包含文字出现前的工具等待；测量点在中转，不含 harness 启动和业务后处理，是推测值。' : '从 harness 调用前计时，到 CLI 输出文字事件；测量点在 CLI，不是浏览器渲染。'}}"><div class="k">首字耗时 ms${{srcBadge(ov, 'first_frame_ms')}}</div><div class="v">${{m.first_frame_ms == null ? "未采集" : tok(m.first_frame_ms)}}${{m.first_frame_kind ? ' (' + esc(m.first_frame_kind) + ')' : ''}}</div></div>
     <div><div class="k">num_turns</div><div class="v">${{tok(m.num_turns)}}</div></div>
     <div><div class="k">num_tool_calls</div><div class="v">${{tok(m.num_tool_calls)}}</div></div>
     <div><div class="k">num_llm_calls</div><div class="v">${{tok(m.num_llm_calls ?? c.n_calls)}}</div></div>
@@ -1727,7 +1801,8 @@ function renderOverview(c) {{
     <div><div class="k">n_events</div><div class="v">${{tok(ov.n_events)}}</div></div>
   </div>`;
   ctxHtml += renderCallTimeline(c.calls, 'case LLM timeline');
-  if (ov.attribution_status && ov.note) ctxHtml += `<p class="sub">${{esc(ov.note)}}</p>`;
+  // 来源已由指标旁的「真实/推测」标签表达；note 只留在原始 JSON，不在页面堆口径说明。
+  if (ov.runner_only) ctxHtml += '<p class="sub">未观测到 LLM 调用（不代表没有调用）</p>';
   if (ov.error) ctxHtml += `<div class="tool"><strong>error</strong><pre>${{esc(ov.error)}}</pre></div>`;
   const turns = ov.turns || [];
   if (!turns.length) {{
@@ -1735,7 +1810,7 @@ function renderOverview(c) {{
   }} else {{
     turns.forEach(t => {{
       ctxHtml += `<div class="msg"><div class="role">${{"turn " + esc(t.index) + " · 输入 prompt"}}</div><pre>${{esc(t.prompt || '')}}</pre></div>`;
-      ctxHtml += `<div class="msg assistant"><div class="role">${{"turn " + esc(t.index) + " · 输出 final_text"}}</div><pre>${{esc(t.final_text || '')}}</pre></div>`;
+      ctxHtml += `<div class="msg assistant"><div class="role">${{"turn " + esc(t.index) + " · 输出 final_text"}}${{srcBadge(ov, 'final_text')}}</div><pre>${{esc(t.final_text || '')}}</pre></div>`;
     }});
   }}
   const evs = ov.events || [];
@@ -1759,7 +1834,7 @@ function renderOverview(c) {{
   ctx.innerHTML = ctxHtml;
 
   reply.innerHTML = turns.length
-    ? turns.map(t => `<div class="msg assistant"><div class="role">${{"turn " + esc(t.index) + " final"}}</div><pre>${{esc(t.final_text || '')}}</pre></div>`).join('')
+    ? turns.map(t => `<div class="msg assistant"><div class="role">${{"turn " + esc(t.index) + " final"}}${{srcBadge(ov, 'final_text')}}</div><pre>${{esc(t.final_text || '')}}</pre></div>`).join('')
     : '<div class="empty">无最终输出</div>';
 
   const tl = ov.tool_timeline || [];
@@ -1772,6 +1847,7 @@ function renderOverview(c) {{
     metrics: ov.metrics, turns: ov.turns, tool_timeline: ov.tool_timeline,
     artifacts: ov.artifacts, n_events: ov.n_events,
     events: ov.events, note: ov.note, wire_only: ov.wire_only, runner_only: ov.runner_only,
+    provenance: ov.provenance,
     attribution_status: ov.attribution_status,
   }};
   raw.innerHTML = `<div class="msg"><pre>${{esc(JSON.stringify(slim, null, 2))}}</pre></div>`
@@ -1885,6 +1961,9 @@ function renderDetail() {{
   ctx.innerHTML = ctxHtml || '<div class="empty">无 messages</div>';
 
   let replyHtml = '';
+  if (call.state === 'failed' || call.incomplete) {{
+    replyHtml += '<div class="tool"><strong>调用失败' + (call.incomplete ? ' · 以下为断流前收到的部分内容，未完成' : '') + '</strong></div>';
+  }}
   if (call.thinking) {{
     replyHtml += `<div class="msg"><div class="role">thinking</div><pre>${{esc(call.thinking)}}</pre></div>`;
   }}
@@ -1896,7 +1975,7 @@ function renderDetail() {{
     replyHtml += `<div class="msg"><div class="role">usage</div><pre>${{esc(JSON.stringify(call.usage, null, 2))}}</pre></div>`;
   }}
   if (call.response_error || call.incomplete_details) replyHtml += `<div class="tool"><pre>${{esc(JSON.stringify(call.response_error || call.incomplete_details, null, 2))}}</pre></div>`;
-  if (call.error) replyHtml += `<div class="tool"><strong>error</strong><pre>${{esc(call.error)}}</pre></div>`;
+  if (call.error) replyHtml += `<div class="tool"><strong>error</strong><pre>${{esc(typeof call.error === 'string' ? call.error : JSON.stringify(call.error, null, 2))}}</pre></div>`;
   reply.innerHTML = replyHtml;
 
   const brief = (call.raw_request && call.raw_request.tools_brief) || [];

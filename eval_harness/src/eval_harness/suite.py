@@ -552,6 +552,7 @@ def lane_upstream(run_dir: Path, side: str) -> dict[str, Any]:
 
 def mandatory_preflight(
     *, agents: list[str], claude_config: Optional[Path], pi_config: Optional[Path], out_dir: Path,
+    itools_sync_mode: str = "ensure",
 ) -> dict[str, Any]:
     """New mandatory health gate (eval_harness.preflight) for the selected lanes; exits 4 on failure.
 
@@ -564,7 +565,8 @@ def mandatory_preflight(
         specs.append(pf.spec_from_config_path(claude_config))
     if "pi" in agents and pi_config is not None:
         specs.append(pf.spec_from_config_path(pi_config))
-    res = pf.run_preflight(specs, eval_runs_dir=out_dir, include_insurance="insurance" in agents)
+    res = pf.run_preflight(specs, eval_runs_dir=out_dir, include_insurance="insurance" in agents,
+                           itools_sync_mode=itools_sync_mode)
     path = out_dir / "preflight.json"
     path.write_text(json.dumps(res, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     if not res["ok"]:
@@ -612,6 +614,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--skip-preflight", action="store_true",
                    help="TESTS ONLY: skip gateway + mandatory preflight (recorded in manifest/run_meta)")
+    p.add_argument("--itools-sync", choices=("ensure", "check"), default="ensure",
+                   help="MCP upstream alignment: ensure auto-syncs; check only validates")
     p.add_argument("--claude-only", action="store_true", help="Deprecated alias: --agents claude")
     p.add_argument("--insurance-only", action="store_true", help="Deprecated alias: --agents insurance")
     p.add_argument("--pi-only", action="store_true", help="Alias: --agents pi")
@@ -747,6 +751,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 claude_config=config if "claude" in agents else None,
                 pi_config=pi_config if "pi" in agents else None,
                 out_dir=dual_root,
+                itools_sync_mode=args.itools_sync,
             )
             manifest["preflight"] = {k: _pf[k] for k in ("ok", "at", "harnesses", "failed", "elapsed_s")}
             manifest["preflight"]["file"] = str(dual_root / "preflight.json")

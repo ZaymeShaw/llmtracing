@@ -61,3 +61,65 @@ if __name__ == "__main__":
             fn()
             print("ok", name)
     print("ALL_PASS")
+
+
+# --- W3C traceparent / baggage -------------------------------------------------
+from callbacks.case_id import (  # noqa: E402
+    baggage_entries,
+    extract_trace_labels,
+    resolve_execution_id,
+    trace_id_from_traceparent,
+)
+
+EID = "8f385dd2b3a2468aa9161121eae9c688"
+TP = f"00-{EID}-00f067aa0ba902b7-01"
+
+
+def test_traceparent_validation():
+    assert trace_id_from_traceparent({"traceparent": TP}) == EID
+    assert trace_id_from_traceparent({"Traceparent": TP.upper()}) is None  # lowercase hex only
+    for bad in ("00-" + "0" * 32 + "-00f067aa0ba902b7-01", f"00-{EID}-" + "0" * 16 + "-01",
+                f"ff-{EID}-00f067aa0ba902b7-01", f"00-{EID[:-1]}-00f067aa0ba902b7-01", "junk"):
+        assert trace_id_from_traceparent({"traceparent": bad}) is None, bad
+
+
+def test_baggage_parsing():
+    h = {"baggage": "other=1, eval.case_id=INS_A01;prop=x,eval.run_id=runs%2Fr1 ,eval.case_id=dup"}
+    assert baggage_entries(h) == {"eval.case_id": "INS_A01", "eval.run_id": "runs/r1"}
+    assert baggage_entries({"baggage": "eval.case_id=" + "x" * 9000}) == {}
+
+
+def test_execution_id_precedence_and_conflicts():
+    bag = f"eval.execution_id={EID},eval.case_id=C1"
+    assert resolve_execution_id(headers={"traceparent": TP}) == (EID, "traceparent", [])
+    other = "a" * 32
+    # OTel client instrumentation re-rooted the trace: baggage still wins.
+    eid, src, warns = resolve_execution_id(headers={"baggage": bag, "traceparent": f"00-{other}-00f067aa0ba902b7-01"})
+    assert (eid, src) == (EID, "baggage") and warns and other in warns[0]
+    eid, src, _ = resolve_execution_id(headers={"x-eval-execution-id": "hdr1", "baggage": bag, "traceparent": TP})
+    assert (eid, src) == ("hdr1", "header")
+    assert resolve_execution_id(headers={}) == (None, None, [])
+
+
+def test_case_id_from_baggage_below_header():
+    assert extract_case_id(headers={"baggage": "eval.case_id=C1"}) == ("C1", "baggage", [])
+    cid, src, warns = extract_case_id(headers={"x-eval-case-id": "C2", "baggage": "eval.case_id=C1"})
+    assert (cid, src) == ("C2", "header") and warns
+
+
+def test_trace_labels_from_baggage_and_traceparent():
+    labels = extract_trace_labels(headers={"baggage": "eval.run_id=r1,eval.harness=h", "traceparent": TP})
+    assert labels == {"run_id": "r1", "harness": "h", "trace_id": EID}
+    assert extract_trace_labels(headers={"x-eval-run-id": "r2", "baggage": "eval.run_id=r1"})["run_id"] == "r2"
+
+
+def test_verifier_labels_are_independent_of_business_ids():
+    from callbacks.case_id import extract_trace_labels
+    result = extract_trace_labels(headers={
+        'X-Eval-Harness': 'verifier', 'X-Eval-Run-Id': 'job-1',
+        'X-Eval-Project-Id': 'llm_probe', 'X-Eval-Role': 'judge',
+        'X-Eval-Stage': 'assessment', 'X-Eval-Verifier-Trace-Id': 'business-trace-ref',
+    })
+    assert result == dict(harness='verifier', run_id='job-1', project_id='llm_probe',
+                          role='judge', stage='assessment', verifier_trace_id='business-trace-ref')
+    assert 'execution_id' not in result

@@ -34,6 +34,7 @@ from eval_harness.llm_gateway_ingest import (
     attach_llm_calls_to_trace,
     filter_pairs_by_execution_id,
     load_gateway_pairs,
+    snapshot_offsets,
     pairs_to_excel_rows,
     pairs_to_trace_calls,
     write_case_llm_jsonl,
@@ -870,12 +871,10 @@ def _main(argv, stack) -> int:
         case_t0 = datetime.now(TZ)
         # Gateway log offset at case start: only calls made after this point can belong to
         # the case, so ingest reads the tail instead of the whole (hundreds of MB) log.
+        # Default: the whole logs dir (legacy shared file + logs/gateways/<name>/), per-file offsets.
         _gw_log_path = (Path(str(cfg.get("llm_gateway_log"))).expanduser() if cfg.get("llm_gateway_log")
-                        else PROJECT_ROOT / "llm_gateway" / "logs" / "llm_calls.jsonl")
-        try:
-            gw_offset = _gw_log_path.stat().st_size if _gw_log_path.is_file() else 0
-        except OSError:
-            gw_offset = 0
+                        else PROJECT_ROOT / "llm_gateway" / "logs")
+        gw_offset = snapshot_offsets(_gw_log_path)
         if concurrency <= 1:
             _set_current_case_id(case.case_id)
         try:
@@ -938,9 +937,7 @@ def _main(argv, stack) -> int:
                 turn_rows.extend(tr)
                 tool_rows.extend(tool)
                 case_windows.append((case.case_id, case_t0, case_t1))
-            gw_log = Path(str(cfg.get("llm_gateway_log") or "")).expanduser() if cfg.get("llm_gateway_log") else None
-            if gw_log is None or not str(gw_log):
-                gw_log = PROJECT_ROOT / "llm_gateway" / "logs" / "llm_calls.jsonl"
+            gw_log = _gw_log_path
             capture_complete = False
             local_llm_rows = []
             try:
@@ -949,7 +946,7 @@ def _main(argv, stack) -> int:
                 deadline = _time.monotonic() + 30.0
                 while True:
                     pairs = filter_pairs_by_execution_id(
-                        load_gateway_pairs(gw_log, start_offset=gw_offset if gw_log == _gw_log_path else 0),
+                        load_gateway_pairs(gw_log, start_offset=gw_offset),
                         case_id=case.case_id,
                         execution_id=identity["execution_id"],
                     )

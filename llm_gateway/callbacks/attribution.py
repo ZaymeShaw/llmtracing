@@ -1,4 +1,12 @@
-"""Opt-in, fail-closed attribution for an exclusive Insurance gateway lane.
+"""Opt-in, fail-closed attribution for an exclusive evaluation gateway lane.
+
+Two configuration modes (see ``lane_mode``):
+
+- ``env`` (preferred): one gateway process == one lane. The launcher
+  (gatewayctl) sets ``LLM_GATEWAY_NAME`` and the gateway's ``.env.<name>``
+  declares ``LANE_POOL``. Only this process's own master key maps to the lane.
+- ``json`` (deprecated): ``LLM_ATTRIBUTION_CONFIG`` points at
+  ``attribution_lanes.json`` listing every lane; every lane key env must be set.
 
 The configuration binds an authenticated LiteLLM key hash to a lane. A lane's
 registry is written by the evaluation runner; this callback only reads it.
@@ -15,14 +23,60 @@ from pathlib import Path
 from typing import Any
 
 LANE_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
-DEFAULT_CONFIG = Path(__file__).resolve().parents[1] / "attribution_lanes.json"
+GATEWAY_DIR = Path(__file__).resolve().parents[1]
+DEFAULT_CONFIG = GATEWAY_DIR / "attribution_lanes.json"
+DEFAULT_REGISTRY_DIR = GATEWAY_DIR / "run" / "attribution"
+
+
+def lane_mode() -> str | None:
+    """``json`` if LLM_ATTRIBUTION_CONFIG is set (legacy wins), ``env`` if LANE_POOL is set, else None."""
+    if (os.environ.get("LLM_ATTRIBUTION_CONFIG") or "").strip():
+        return "json"
+    if (os.environ.get("LANE_POOL") or "").strip():
+        return "env"
+    return None
+
+
+def gateway_name() -> str:
+    return (os.environ.get("LLM_GATEWAY_NAME") or "").strip()
 
 
 def config_path() -> Path:
     return Path(os.environ.get("LLM_ATTRIBUTION_CONFIG", str(DEFAULT_CONFIG))).resolve()
 
 
+def env_registry_dir() -> Path:
+    raw = (os.environ.get("LANE_REGISTRY_DIR") or "").strip()
+    if not raw:
+        return DEFAULT_REGISTRY_DIR
+    path = Path(raw).expanduser()
+    return (path if path.is_absolute() else GATEWAY_DIR / path).resolve()
+
+
+def load_env_config() -> dict[str, Any]:
+    """Single-lane config for this gateway process (lane_id == gateway name)."""
+    lane_id = gateway_name()
+    if not LANE_RE.fullmatch(lane_id):
+        raise ValueError("LANE_POOL set but LLM_GATEWAY_NAME missing/invalid (start via llmtrace gateway up)")
+    pool = (os.environ.get("LANE_POOL") or "").strip()
+    if not LANE_RE.fullmatch(pool):
+        raise ValueError("invalid LANE_POOL")
+    key = (os.environ.get("LITELLM_MASTER_KEY") or "").strip()
+    if not key:
+        raise ValueError("missing gateway key env LITELLM_MASTER_KEY")
+    key_hash = hashlib.sha256(key.encode()).hexdigest()
+    return {
+        "mode": "env",
+        "lanes": {lane_id: {"pool": pool, "chat_url": (os.environ.get("LANE_TARGET_URL") or "").strip() or None,
+                            "gateway_key_env": "LITELLM_MASTER_KEY"}},
+        "key_to_lane": {key_hash: lane_id},
+        "registry_dir": env_registry_dir(),
+    }
+
+
 def load_config(path: Path | None = None) -> dict[str, Any]:
+    if path is None and lane_mode() == "env":
+        return load_env_config()
     path = Path(path or config_path()).resolve()
     data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict) or not isinstance(data.get("lanes"), dict):
@@ -56,7 +110,7 @@ def load_config(path: Path | None = None) -> dict[str, Any]:
             raise ValueError("one gateway key cannot identify two lanes")
         key_to_lane[key_hash] = lane_id
         lanes[lane_id] = {"chat_url": chat_url, "gateway_key_env": env_name}
-    return {"lanes": lanes, "key_to_lane": key_to_lane, "registry_dir": registry_dir}
+    return {"mode": "json", "lanes": lanes, "key_to_lane": key_to_lane, "registry_dir": registry_dir}
 
 
 def gateway_ready_filename(port: int | str) -> str:
@@ -74,8 +128,15 @@ def mark_gateway_ready() -> None:
     Marker is per listen port so concurrent Claude (:4001) and Insurance (:4002)
     gateways do not overwrite each other.
     """
-    path = config_path()
-    cfg = load_config(path)
+    mode = lane_mode()
+    if mode == "env":
+        cfg = load_env_config()
+        # The runner compares against the gateway's own .env.<name> file.
+        raw_env = (os.environ.get("LLM_GATEWAY_ENV_FILE") or "").strip()
+        path = Path(raw_env).resolve() if raw_env else None
+    else:
+        path = config_path()
+        cfg = load_config(path)
     directory = cfg["registry_dir"]
     directory.mkdir(parents=True, exist_ok=True)
     port = str(os.environ.get("LITELLM_PORT", "4001")).strip() or "4001"
@@ -85,8 +146,11 @@ def mark_gateway_ready() -> None:
         "pid": os.getpid(),
         "port": int(port) if port.isdigit() else port,
         "profile": profile or None,
-        "config_path": str(path),
-        "config_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        "mode": mode,
+        "gateway": gateway_name() or None,
+        "lane_pool": (os.environ.get("LANE_POOL") or "").strip() or None if mode == "env" else None,
+        "config_path": str(path) if path else None,
+        "config_sha256": hashlib.sha256(path.read_bytes()).hexdigest() if path and path.is_file() else None,
         "started_at_epoch": time.time(),
     }
     marker.write_text(json.dumps(payload) + "\n", encoding="utf-8")

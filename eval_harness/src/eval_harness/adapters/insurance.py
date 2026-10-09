@@ -9,7 +9,7 @@ Does not import or modify the insurance_qa_agent repo.
 """
 from __future__ import annotations
 
-from eval_harness.trace_identity import archive_case, new_identity, write_identity, trace_headers
+from eval_harness.trace_identity import archive_case, new_identity, write_identity, trace_headers, w3c_trace_headers
 
 import argparse
 import asyncio
@@ -334,6 +334,9 @@ def _post_live_chat(
         headers["X-Eval-Case-Id"] = case_id
     if execution_id:
         headers["X-Eval-Execution-Id"] = execution_id
+        # Standard form of the same identity; the gateway prefers X-Eval-* when both arrive.
+        headers.update(w3c_trace_headers(execution_id=execution_id, case_id=case_id,
+                                         run_id=headers.get("X-Eval-Run-Id")))
     try:
         with httpx.Client(trust_env=False, timeout=timeout_sec) as client:
             r = client.post(chat_url, json=payload, headers=headers or None)
@@ -427,8 +430,16 @@ def run_live_batch(
     resume: bool = False,
     lane_id: str = "insurance_1",
     attribution_config: Optional[Path] = None,
+    lanes: Optional[str] = None,
+    gateway_dir: Optional[Path] = None,
 ) -> dict[str, Any]:
-    """Serialize writers to a batch directory while cases still run concurrently."""
+    """Serialize writers to a batch directory while cases still run concurrently.
+
+    Lane mode (default): ``lanes`` is a LANE_POOL or comma-separated gateway names
+    (default ``$INSURANCE_LANES`` or ``insurance``); one worker per ready lane, each
+    posting to its lane's LANE_TARGET_URL and ingesting its own gateway log.
+    Legacy mode: pass ``attribution_config`` (attribution_lanes.json + ``lane_id``).
+    """
     from eval_harness.trace_identity import writer_lock
     run_id = run_id or f"insurance_datasetA_{_now_tag()}_{uuid.uuid4().hex[:8]}"
     with writer_lock(Path(eval_runs_dir or DEFAULT_EVAL_RUNS_DIR) / run_id):
@@ -437,6 +448,7 @@ def run_live_batch(
             user_id=user_id, bundle_path=bundle_path, eval_runs_dir=eval_runs_dir,
             gateway_log=gateway_log, timeout_sec=timeout_sec, resume=resume,
             lane_id=lane_id, attribution_config=attribution_config,
+            lanes=lanes, gateway_dir=gateway_dir,
         )
 
 
@@ -453,6 +465,8 @@ def _run_live_batch(
     resume: bool = False,
     lane_id: str = "insurance_1",
     attribution_config: Optional[Path] = None,
+    lanes: Optional[str] = None,
+    gateway_dir: Optional[Path] = None,
 ) -> dict[str, Any]:
     """Live Insurance QA batch: per-case chat + gateway ingest + auto llm_trace.html."""
     from eval_harness.llm_trace_html import build_llm_trace_html
@@ -460,15 +474,36 @@ def _run_live_batch(
 
     bundle_path = Path(bundle_path or DEFAULT_BUNDLE)
     eval_runs_dir = Path(eval_runs_dir or DEFAULT_EVAL_RUNS_DIR)
-    gateway_log = Path(gateway_log or DEFAULT_GATEWAY_LOG)
     run_id = run_id or f"insurance_datasetA_{_now_tag()}_{uuid.uuid4().hex[:8]}"
-    attribution_config = Path(attribution_config or MOCK_SYSTEM_ROOT / "llm_gateway" / "attribution_lanes.json")
-    lane_directory, _ = lane_config(attribution_config, lane_id, chat_url)
-    # Insurance live batch attributes via the dedicated :4002 gateway process.
-    ready_port = os.environ.get("INSURANCE_LITELLM_PORT") or os.environ.get("LLM_ATTRIBUTION_READY_PORT") or "4002"
-    require_gateway_ready(lane_directory, attribution_config, port=ready_port)
-    if not gateway_log.is_file():
-        raise RuntimeError(f"gateway log unavailable: {gateway_log}")
+    lane_mode = attribution_config is None
+    lane_specs: list[Any] = []
+    lanes_skipped: dict[str, str] = {}
+    lane_directory: Optional[Path] = None
+    if lane_mode:
+        # One gateway process per lane (llm_gateway/.env.<name> with LANE_POOL).
+        from eval_harness.gateways import lane_not_ready, resolve_lanes
+        lanes = (lanes or os.environ.get("INSURANCE_LANES") or "insurance").strip()
+        for spec in resolve_lanes(lanes, gateway_dir):
+            reason = lane_not_ready(spec)
+            if reason:
+                lanes_skipped[spec.name] = reason
+                print(f"[live-batch] WARN lane {spec.name} skipped: {reason}", flush=True)
+            else:
+                lane_specs.append(spec)
+        if not lane_specs:
+            raise RuntimeError(f"no ready lane in {lanes!r}: " + "; ".join(f"{k}: {v}" for k, v in lanes_skipped.items()))
+        if chat_url and chat_url != DEFAULT_CHAT_URL and chat_url not in {s.chat_url for s in lane_specs}:
+            print(f"[live-batch] WARN chat_url={chat_url} ignored; lanes use their LANE_TARGET_URL", flush=True)
+        gateway_log = None
+    else:
+        gateway_log = Path(gateway_log or DEFAULT_GATEWAY_LOG)
+        attribution_config = Path(attribution_config)
+        lane_directory, _ = lane_config(attribution_config, lane_id, chat_url)
+        # Legacy: attribution via the dedicated :4002 gateway process.
+        ready_port = os.environ.get("INSURANCE_LITELLM_PORT") or os.environ.get("LLM_ATTRIBUTION_READY_PORT") or "4002"
+        require_gateway_ready(lane_directory, attribution_config, port=ready_port)
+        if not gateway_log.is_file():
+            raise RuntimeError(f"gateway log unavailable: {gateway_log}")
     full_run_id = f"{eval_runs_dir.name}/{run_id}"
     run_dir = eval_runs_dir / run_id
     cases_root = run_dir / "cases"
@@ -554,9 +589,13 @@ def _run_live_batch(
 
     print(f"[live-batch] run_id={run_id}", flush=True)
     print(f"[live-batch] run_dir={run_dir}", flush=True)
-    print(f"[live-batch] chat_url={chat_url} user_id={user_id}", flush=True)
     print(f"[live-batch] bundle={bundle_path} cases={','.join(b for b, _, _ in selected)}", flush=True)
-    print(f"[live-batch] gateway_log={gateway_log}", flush=True)
+    if lane_mode:
+        for spec in lane_specs:
+            print(f"[live-batch] lane={spec.name} chat_url={spec.chat_url} gateway_log={spec.gateway_log}", flush=True)
+    else:
+        print(f"[live-batch] chat_url={chat_url} user_id={user_id}", flush=True)
+        print(f"[live-batch] gateway_log={gateway_log}", flush=True)
     if resume:
         print("[live-batch] resume=1 (skip completed cases; archive incomplete attempts)", flush=True)
 
@@ -566,7 +605,9 @@ def _run_live_batch(
         concurrency = max(1, int(_conc_raw))
     except ValueError:
         concurrency = 1
-    print(f"[live-batch] concurrency={concurrency}", flush=True)
+    if lane_mode:
+        concurrency = len(lane_specs)  # one worker per lane; INSURANCE_LIVE_CONCURRENCY ignored
+    print(f"[live-batch] concurrency={concurrency}" + (" (lanes)" if lane_mode else ""), flush=True)
     _summary_lock = threading.Lock()
 
     def _append_summary(row: dict[str, Any]) -> None:
@@ -579,7 +620,9 @@ def _run_live_batch(
         def finish(self, **kwargs):
             return None
 
-    def _run_one_insurance_case(bundle_id: str, ins_id: str, turns: list, lane) -> None:
+    def _run_one_insurance_case(bundle_id: str, ins_id: str, turns: list, lane, *,
+                                chat_url: str, gateway_log: Path, lane_id: str) -> bool:
+        """Run one case on one lane; returns True if the lane must be treated as blocked."""
         nonlocal n_skipped
         case_dir = cases_root / ins_id
         if resume:
@@ -624,7 +667,7 @@ def _run_live_batch(
                 with _summary_lock:
                     n_skipped += 1
                 print(f"[case] {ins_id} SKIP success (resume)", flush=True)
-                return
+                return False
             if case_dir.exists():
                 print(f"[case] {ins_id} ARCHIVE incomplete then run", flush=True)
                 archive_case(case_dir)
@@ -635,7 +678,7 @@ def _run_live_batch(
         identity = new_identity(str(run_id), "insurance_qa_agno", ins_id)
         execution_id = identity["execution_id"]
         write_identity(case_dir, identity)
-        start_offset = gateway_log.stat().st_size
+        start_offset = gateway_log.stat().st_size if gateway_log.is_file() else 0
         case_t0 = datetime.now(TZ)
         (case_dir / "prompt.txt").write_text(turns[0], encoding="utf-8")
         (case_dir / "prompt_turns.json").write_text(
@@ -834,7 +877,7 @@ def _run_live_batch(
                     "error": msg,
                 }
             )
-            return
+            return True
 
         preview = (answer or "")[:120].replace("\n", " ")
         status_s = "OK" if ok else "FAIL"
@@ -858,11 +901,64 @@ def _run_live_batch(
                 "error": meta["error"],
             }
         )
+        return False
 
-    if concurrency <= 1:
+    unrun: list[str] = []
+    lanes_dropped: dict[str, str] = {}
+    if lane_mode:
+        import queue as _queue
+        import time as _stagger_time
+        work: "_queue.Queue[tuple[str, str, list]]" = _queue.Queue()
+        for item in selected:
+            work.put(item)
+        _ran = {"n": 0}
+
+        def _lane_worker(index: int, spec: Any) -> None:
+            try:
+                lease = LaneLease(spec.registry_dir, spec.name).__enter__()
+            except (RuntimeError, BlockingIOError, OSError) as exc:
+                lanes_dropped[spec.name] = f"lease unavailable: {exc}"
+                print(f"[live-batch] WARN lane {spec.name} not used: {exc} "
+                      f"(recover: python -m eval_harness.attribution_lane --gateway {spec.name} --execution-id ...)",
+                      flush=True)
+                return
+            try:
+                delay = _case_submit_delay(index)
+                if delay > 0:
+                    _stagger_time.sleep(delay)
+                while True:
+                    try:
+                        bundle_id, ins_id, turns = work.get_nowait()
+                    except _queue.Empty:
+                        return
+                    with _summary_lock:
+                        _ran["n"] += 1
+                    blocked = _run_one_insurance_case(bundle_id, ins_id, turns, lease, chat_url=spec.chat_url,
+                                                      gateway_log=spec.gateway_log, lane_id=spec.name)
+                    if blocked:
+                        # A stale in-flight call could be attributed to the next case: stop using this lane.
+                        lanes_dropped[spec.name] = f"blocked after {ins_id}"
+                        print(f"[live-batch] lane {spec.name} dropped (blocked after {ins_id})", flush=True)
+                        return
+            finally:
+                lease.__exit__(None, None, None)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(lane_specs)) as pool:
+            futs = [pool.submit(_lane_worker, i, spec) for i, spec in enumerate(lane_specs)]
+            errors = [f.exception() for f in futs if f.exception() is not None]
+        if errors:
+            raise errors[0]
+        while not work.empty():
+            unrun.append(work.get_nowait()[1])
+        if _ran["n"] == 0 and unrun:
+            raise RuntimeError("no lane could be leased: " + "; ".join(f"{k}: {v}" for k, v in lanes_dropped.items()))
+        if unrun:
+            print(f"[live-batch] WARN {len(unrun)} case(s) not run (all lanes dropped): {','.join(unrun)}", flush=True)
+    elif concurrency <= 1:
         with LaneLease(lane_directory, lane_id) as lane:
             for bundle_id, ins_id, turns in selected:
-                _run_one_insurance_case(bundle_id, ins_id, turns, lane)
+                _run_one_insurance_case(bundle_id, ins_id, turns, lane,
+                                        chat_url=chat_url, gateway_log=gateway_log, lane_id=lane_id)
     else:
         # Dual-id headers attribute; exclusive LaneLease would serialize — skip it.
         null_lane = _NullLane()
@@ -874,7 +970,8 @@ def _run_live_batch(
                 if _delay > 0:
                     print(f"[live-batch] stagger submit i={_si} sleep={_delay:.2f}s", flush=True)
                     _stagger_time.sleep(_delay)
-                futs.append(pool.submit(_run_one_insurance_case, bundle_id, ins_id, turns, null_lane))
+                futs.append(pool.submit(_run_one_insurance_case, bundle_id, ins_id, turns, null_lane,
+                                        chat_url=chat_url, gateway_log=gateway_log, lane_id=lane_id))
             errors = []
             for fut in concurrent.futures.as_completed(futs):
                 exc = fut.exception()
@@ -897,12 +994,16 @@ def _run_live_batch(
         "harness": "insurance_qa_live",
         "profile_id": "insurance_qa_local_relay",
         "bundle_path": str(bundle_path),
-        "chat_url": chat_url,
+        "chat_url": chat_url if not lane_mode else [s.chat_url for s in lane_specs],
         "user_id": user_id,
-        "gateway_log": str(gateway_log),
+        "gateway_log": [str(s.gateway_log) for s in lane_specs] if lane_mode else str(gateway_log),
+        "lanes": ({"selector": lanes, "used": [s.name for s in lane_specs], "skipped": lanes_skipped,
+                   "dropped": lanes_dropped} if lane_mode else {"legacy_lane_id": lane_id}),
         "eval_runs_dir": str(eval_runs_dir),
-        "n_cases": len(summary_rows),
+        "n_cases": len(summary_rows) + len(unrun),
         "n_ok": sum(1 for r in summary_rows if r.get("ok")),
+        "n_unrun": len(unrun),
+        "unrun_cases": unrun,
         "timezone": "Asia/Shanghai",
         "mode": "live_batch_resume" if resume else "live_batch",
         "n_skipped_success": n_skipped,
@@ -939,6 +1040,7 @@ def _run_live_batch(
         "n_ok": run_meta["n_ok"],
         "n_cases": run_meta["n_cases"],
         "summary": summary_rows,
+        "n_unrun": len(unrun),
         "auto_html": True,
     }
     print(
@@ -984,8 +1086,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--eval-runs-dir", type=Path, default=DEFAULT_EVAL_RUNS_DIR)
     ap.add_argument("--gateway-log", type=Path, default=DEFAULT_GATEWAY_LOG)
     ap.add_argument("--timeout-sec", type=float, default=180.0)
-    ap.add_argument("--lane", default="insurance_1")
-    ap.add_argument("--attribution-config", type=Path, default=None)
+    ap.add_argument("--lanes", default=None,
+                    help="Lane pool or comma-separated gateway names (default $INSURANCE_LANES or 'insurance')")
+    ap.add_argument("--lane", default="insurance_1", help="legacy: lane id in --attribution-config")
+    ap.add_argument("--attribution-config", type=Path, default=None,
+                    help="legacy single-lane mode (attribution_lanes.json); omit for lane mode")
     # smoke-mode args (ignored when --live-batch)
     ap.add_argument("--case-id", default="INS_SMOKE_001")
     ap.add_argument("--prompt", default="ping insurance relay adapter")
@@ -1010,6 +1115,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             resume=bool(args.resume),
             lane_id=args.lane,
             attribution_config=args.attribution_config,
+            lanes=args.lanes,
         )
         print(json.dumps({
             "ok": result["n_ok"] == result["n_cases"] and bool(result.get("html_path")),

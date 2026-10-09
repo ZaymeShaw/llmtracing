@@ -8,9 +8,9 @@ adapter:
   chat_url: http://127.0.0.1:18063/v1/chat
   user_id: "1050900009"
   timeout_sec: 180
-  lane_id: insurance_1
-  gateway_log: ../../../llm_gateway/logs/llm_calls.jsonl
-  attribution_config: ../../../llm_gateway/attribution_lanes.json
+  # Lane pool (LANE_POOL in llm_gateway/.env.<name>) or comma-separated gateway names.
+  # One worker per ready lane; each posts to its LANE_TARGET_URL and reads its own gateway log.
+  lanes: insurance
 notes: >
   Native HTTP batch runner with per-case gateway attribution and HTML export.
   The Insurance QA service is managed outside this repository.

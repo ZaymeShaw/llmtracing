@@ -72,6 +72,8 @@ open eval_runs/my_batch/llm_trace.html
 
 本机 OpenCode 的日志是 `eval_runs/opencode_gateway_4003/llm_calls.jsonl`，使用上面命令时替换 `--from-gateway-log`。`--out-run-dir` 只决定报告放哪里，不决定中转日志位置。新终端先执行 `source llm_gateway/.venv/bin/activate`。
 
+用 `llmtrace gateway` 管理的具名中转（如 Insurance lane）日志在 `llm_gateway/logs/gateways/<名>/`，可直接 `./llmtrace report html --gateway <名> --out eval_runs/x --run-id my_batch`；多实例 lane 见 `llm_gateway/README.md`。
+
 报告展示模型调用、各轮输入输出和首字耗时；同批同题默认看最新尝试，可勾选历史。新增日志后重新导出即可；模型请求之外的本地执行过程不会被中转采集。
 
 ### 4. 扩展：用 adapter 复用框架批跑

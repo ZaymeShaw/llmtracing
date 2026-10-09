@@ -2,6 +2,9 @@
 
 Default code root is the eval worktree (branch eval/current) with eval header
 passthrough ON.  Override with INSURANCE_QA_ROOT=<repo> to start other code.
+INSURANCE_QA_MODEL_BASE_URL=<url> overrides the model base_url from
+models_<env>_args.yaml (e.g. http://127.0.0.1:4004/v1) so each instance can sit
+behind its own gateway lane without editing the checkout.
 Before start, runs insurance_upstream_align.py ensure (agent/eval + MCP); set
 INSURANCE_UPSTREAM_ALIGN=0 to skip. Writes <STATE_DIR>/server-<port>.pid and
 server-<port>.meta.json (root, git commit, passthrough flag) so the harness can
@@ -62,6 +65,7 @@ meta = {
     "git_dirty": bool(_git("status", "--porcelain", "--untracked-files=no")),
     "eval_header_passthrough": os.environ["IQA_EVAL_HEADER_PASSTHROUGH"].strip().lower() in {"1", "true", "yes"},
     "env_type": env_type, "tool_config_path": str(tool_config_path), "db_file": str(db_file),
+    "model_base_url_override": os.environ.get("INSURANCE_QA_MODEL_BASE_URL") or None,
     "python": sys.executable, "started_at": datetime.now().astimezone().isoformat(timespec="seconds"),
 }
 print("[insurance-qa] " + json.dumps(meta, ensure_ascii=False), flush=True)
@@ -75,6 +79,20 @@ from app.observability.eval_passthrough import EVAL_HEADERS
 EVAL_HEADERS.update({name.lower(): name for name in (
     "X-Eval-Run-Id", "X-Eval-Harness", "X-Eval-Started-At",
 )})
+
+# Per-instance model endpoint (one gateway lane per instance). Patch before app.main /
+# model_router bind the name; every reload of models_conf() gets the override.
+_model_base_url = (os.environ.get("INSURANCE_QA_MODEL_BASE_URL") or "").strip()
+if _model_base_url:
+    import app.conf as _conf
+    _orig_models_conf = _conf.models_conf
+
+    def _models_conf_override():
+        return _orig_models_conf().model_copy(update={"base_url": _model_base_url})
+
+    _conf.models_conf = _models_conf_override
+    import app.main as _main, app.runtime.model_router as _router  # noqa: E402
+    _main.models_conf = _router.models_conf = _models_conf_override
 
 import uvicorn  # noqa: E402
 from app.main import create_app  # noqa: E402

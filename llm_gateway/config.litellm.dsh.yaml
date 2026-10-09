@@ -1,0 +1,18 @@
+# DSH observer lane: preserve caller reasoning policy and reject unsupported
+# parameters. The profile must set LLM_GATEWAY_THINKING_POLICY=passthrough.
+model_list:
+  - model_name: os.environ/UPSTREAM_MODEL
+    litellm_params:
+      model: os.environ/UPSTREAM_LITELLM_MODEL
+      api_base: os.environ/UPSTREAM_API_BASE
+      api_key: os.environ/UPSTREAM_API_KEY
+      drop_params: false
+      num_retries: 0
+      allowed_openai_params: [reasoning_effort]
+
+litellm_settings:
+  drop_params: false
+  callbacks: custom_callbacks.proxy_handler_instance
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY

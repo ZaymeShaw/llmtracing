@@ -357,3 +357,39 @@ def test_gateway_ready_markers_are_per_port(tmp_path: Path, monkeypatch):
     require_gateway_ready(directory, config, port="4001")
     with pytest.raises(RuntimeError, match="not ready on :3999"):
         require_gateway_ready(directory, config, port=3999)
+
+
+def _w3c_kwargs(key: str, headers: dict) -> dict:
+    return {"litellm_call_id": "call-w3c", "metadata": {"user_api_key_hash": key},
+            "litellm_params": {"proxy_server_request": {"headers": headers, "body": {}, "url": "/v1/chat/completions"}},
+            "optional_params": {}}
+
+
+def test_w3c_traceparent_and_baggage_attribution(lane: Path, tmp_path: Path, monkeypatch):
+    log = tmp_path / "calls.jsonl"
+    monkeypatch.setattr(trace_callback, "LOG_FILE", log)
+    callback = trace_callback.EvalTraceLogger()
+    eid = "8f385dd2b3a2468aa9161121eae9c688"
+    rerooted = "0123456789abcdef0123456789abcdef"
+    with LaneLease(lane, "insurance_1") as lease:
+        lease.start(run_id="lane-run", case_id="INS_LANE", execution_id="lane-exec")
+        # Standard headers only: explicit, lane lease not consulted.
+        callback.log_pre_api_call("model", [], _w3c_kwargs("sk-test-lane", {
+            "traceparent": f"00-{eid}-00f067aa0ba902b7-01",
+            "baggage": "eval.case_id=INS_A01,eval.run_id=runs%2Fr1"}))
+        # OTel client re-rooted traceparent; baggage still carries the execution id.
+        callback.log_pre_api_call("model", [], _w3c_kwargs("sk-test-lane", {
+            "traceparent": f"00-{rerooted}-00f067aa0ba902b7-01",
+            "baggage": f"eval.case_id=INS_A01,eval.execution_id={eid}"}))
+        # A foreign trace with no eval baggage falls back to the lane, trace_id kept for lookup.
+        callback.log_pre_api_call("model", [], _w3c_kwargs("sk-test-lane", {
+            "traceparent": f"00-{rerooted}-00f067aa0ba902b7-01"}))
+        lease.finish()
+    first, second, third = [json.loads(line) for line in log.read_text().splitlines()]
+    assert (first["attribution_status"], first["case_id"], first["execution_id"], first["run_id"]) == \
+        ("explicit", "INS_A01", eid, "runs/r1")
+    assert (first["case_id_source"], first["execution_id_source"], first["trace_id"]) == ("baggage", "traceparent", eid)
+    assert (second["execution_id"], second["execution_id_source"], second["trace_id"]) == (eid, "baggage", rerooted)
+    assert any("execution_id conflict" in w for w in second["case_id_warnings"])
+    assert (third["attribution_status"], third["case_id"], third["execution_id"], third["trace_id"]) == \
+        ("attributed", "INS_LANE", "lane-exec", rerooted)
