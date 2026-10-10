@@ -42,7 +42,7 @@ def read_identity(case_dir, calls):
 
 
 def export_executions(pairs, out_dir, *, case_ids=None, run_id=None, execution_ids=None, include_orphans=False):
-    from .llm_gateway_ingest import pairs_to_trace_calls, write_case_llm_jsonl
+    from .llm_gateway_ingest import pairs_to_trace_calls, update_case_llm_jsonl
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     groups = {}
@@ -76,20 +76,20 @@ def export_executions(pairs, out_dir, *, case_ids=None, run_id=None, execution_i
     for key, (identity, rows) in groups.items():
         case_dir = out_dir / "cases" / key
         case_dir.mkdir(parents=True, exist_ok=True)
-        existing = {}
         path = case_dir / "llm_calls.jsonl"
-        if path.is_file():
-            for line in path.read_text().splitlines():
-                row = json.loads(line)
-                existing[row["call_id"]] = row
-        for row in pairs_to_trace_calls(rows, case_id=identity["case_id"]):
-            old = existing.get(row["call_id"], {})
-            # Incremental exports must not discard a terminal event already captured.
-            existing[row["call_id"]] = {**old, **{k: v for k, v in row.items() if v is not None}}
-        calls = sorted(existing.values(), key=lambda r: (identity_start({"started_at": r.get("ts")}), r["call_id"]))
-        for seq, row in enumerate(calls, 1):
-            row["seq"] = seq
-        identity["started_at"] = min((r.get("started_at") or r.get("ts") for r in calls if r.get("started_at") or r.get("ts")), key=lambda v: identity_start({"started_at": v}), default="")
-        (case_dir / "identity.json").write_text(json.dumps(identity, ensure_ascii=False, indent=2) + "\n")
-        write_case_llm_jsonl(path, calls)
+
+        def merge(previous):
+            existing = {row["call_id"]: row for row in previous}
+            for row in pairs_to_trace_calls(rows, case_id=identity["case_id"]):
+                old = existing.get(row["call_id"], {})
+                # Incremental exports must not discard a terminal event already captured.
+                existing[row["call_id"]] = {**old, **{k: v for k, v in row.items() if v is not None}}
+            calls = sorted(existing.values(), key=lambda r: (identity_start({"started_at": r.get("ts")}), r["call_id"]))
+            for seq, row in enumerate(calls, 1):
+                row["seq"] = seq
+            identity["started_at"] = min((r.get("started_at") or r.get("ts") for r in calls if r.get("started_at") or r.get("ts")), key=lambda v: identity_start({"started_at": v}), default="")
+            (case_dir / "identity.json").write_text(json.dumps(identity, ensure_ascii=False, indent=2) + "\n")
+            return calls
+
+        update_case_llm_jsonl(path, merge)
     return out_dir

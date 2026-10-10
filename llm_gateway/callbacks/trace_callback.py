@@ -147,7 +147,14 @@ def _append(record: dict) -> None:
     name = (os.environ.get("LLM_GATEWAY_NAME") or "").strip()
     if name and "gateway" not in record:
         record = {**record, "gateway": name}
-    with LOG_FILE.open("a", encoding="utf-8") as f:
+    try:
+        stream = LOG_FILE.open("a", encoding="utf-8")
+    except FileNotFoundError:
+        # A live gateway can outlast its log directory. Restore the directory
+        # and retry the same record; other storage errors must still propagate.
+        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        stream = LOG_FILE.open("a", encoding="utf-8")
+    with stream as f:
         f.write(json.dumps(record, ensure_ascii=False, default=lambda o: _jsonable(o)) + "\n")
 
 
@@ -249,12 +256,15 @@ def _apply_thinking_policy(data: dict, call_type: str | None) -> str:
         # Observer gateways preserve the harness's own reasoning configuration.
         # OpenAI-compatible transports accept vendor fields via extra_body;
         # allowing `thinking` as an SDK keyword instead raises TypeError.
+        # A deployment-wide allowed_openai_params also invents null effort
+        # when absent; extra_body preserves both presence and value.
         if (os.environ.get("UPSTREAM_PROTOCOL") == "openai"
-                and str(call_type or "").lower() in ("completion", "acompletion", "chat_completion")
-                and "thinking" in data):
+                and str(call_type or "").lower() in ("completion", "acompletion", "chat_completion")):
             extra = data.get("extra_body")
             if extra is None or isinstance(extra, dict):
-                data["extra_body"] = {**(extra or {}), "thinking": data.pop("thinking")}
+                vendor = {k: data.pop(k) for k in ("thinking", "reasoning_effort") if k in data}
+                if vendor:
+                    data["extra_body"] = {**(extra or {}), **vendor}
         meta = data.get("metadata")
         if not isinstance(meta, dict):
             meta = {}

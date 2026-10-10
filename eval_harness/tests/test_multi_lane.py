@@ -138,7 +138,8 @@ def test_live_batch_runs_one_worker_per_lane(tmp_path: Path, monkeypatch):
         meta = json.loads((run_dir / "cases" / case / "meta.json").read_text())
         assert meta["lane_id"] == lane and meta["chat_url"] == urls[lane]
         assert meta["attribution_status"] == "captured"
-        calls = [json.loads(x) for x in (run_dir / "cases" / case / "llm_calls.jsonl").read_text().splitlines()]
+        from eval_harness.llm_gateway_ingest import read_case_llm_jsonl_text
+        calls = [json.loads(x) for x in read_case_llm_jsonl_text(run_dir / "cases" / case).splitlines()]
         assert len(calls) == 1 and calls[0]["execution_id"] == meta["execution_id"]
     run_meta = json.loads((run_dir / "run_meta.json").read_text())
     assert run_meta["lanes"]["used"] == ["ins_a", "ins_b"]

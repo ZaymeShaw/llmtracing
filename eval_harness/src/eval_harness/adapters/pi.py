@@ -960,18 +960,8 @@ def _run_case_in(
     # normalize_trace (transcript_path stays None: its parser is Claude-format).
     transcript_dir = project_cwd / ".pi-tracing"
     save_pi_session_transcript(case_dir, session_id, transcript_dir if transcript_dir.is_dir() else pi_agent_dir, project_cwd)
-    # Also keep raw Pi JSON as stream_pi.jsonl for debugging
-    raw_pi_out = case_dir / "stream_pi.jsonl"
-    with raw_pi_out.open("w", encoding="utf-8") as w:
-        for i in range(1, len(turn_results) + 1):
-            sp = case_dir / f"stream_turn{i}.jsonl"
-            if not sp.is_file():
-                continue
-            w.write(f"### TURN {i}\n")
-            body = sp.read_text(encoding="utf-8", errors="replace")
-            w.write(body)
-            if body and not body.endswith("\n"):
-                w.write("\n")
+    # concat_streams already preserves this exact raw Pi stream in stream.jsonl.
+    # A second stream_pi.jsonl copy adds no information and has no consumers.
 
     # Optimize success: any turn error (incl. Pi stream errorMessage) => not success,
     # even when the CLI process exited 0 and emitted agent_end.

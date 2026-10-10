@@ -6,9 +6,7 @@ Do not force Anthropic-shaped system/messages/tools columns.
 from __future__ import annotations
 
 import json
-import os
 import re
-import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -437,43 +435,40 @@ def pairs_to_excel_rows(pairs: list[dict[str, Any]], *, case_id: str) -> list[di
 
 
 def case_llm_calls_path(case_dir: Path) -> Path | None:
-    """Prefer plain llm_calls.jsonl; fall back to llm_calls.jsonl.gz after post-run slim."""
-    plain = Path(case_dir) / "llm_calls.jsonl"
-    if plain.is_file():
-        return plain
-    gz = Path(case_dir) / "llm_calls.jsonl.gz"
-    if gz.is_file():
-        return gz
-    return None
+    """Resolve the logical call artifact in either legacy plain or gzip storage."""
+    from .case_artifacts import calls_path
+    return calls_path(case_dir)
 
 
 def read_case_llm_jsonl_text(case_dir: Path) -> str | None:
     """Read per-case llm_calls.jsonl or llm_calls.jsonl.gz as UTF-8 text."""
-    path = case_llm_calls_path(case_dir)
-    if path is None:
-        return None
-    if path.name.endswith(".gz"):
-        import gzip
-
-        with gzip.open(path, "rt", encoding="utf-8") as f:
-            return f.read()
-    return path.read_text(encoding="utf-8")
+    from .case_artifacts import read_calls_bytes
+    raw = read_calls_bytes(case_dir)
+    return raw.decode("utf-8") if raw is not None else None
 
 
-def write_case_llm_jsonl(path: Path, calls: list[dict[str, Any]]) -> None:
+def _write_case_calls_locked(path: Path, calls: list[dict[str, Any]]) -> Path:
+    from .case_artifacts import atomic_write_calls
+    return atomic_write_calls(path, ((json.dumps(c, ensure_ascii=False, default=str) + "\n").encode("utf-8")
+                                    for c in calls))
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary = tempfile.mkstemp(prefix=".llm-calls-", dir=path.parent)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            for c in calls:
-                f.write(json.dumps(c, ensure_ascii=False, default=str) + "\n")
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(temporary, path)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
+
+def write_case_llm_jsonl(path: Path, calls: list[dict[str, Any]]) -> Path:
+    """Publish a full snapshot; new cases use gzip, existing plain cases stay plain."""
+    from .trace_identity import writer_lock
+    with writer_lock(Path(path).parent):
+        return _write_case_calls_locked(path, calls)
+
+
+def update_case_llm_jsonl(path: Path, update) -> list[dict[str, Any]]:
+    """Keep read/merge/write under one case lock, including compressed snapshots."""
+    from .trace_identity import writer_lock
+    with writer_lock(Path(path).parent):
+        text = read_case_llm_jsonl_text(Path(path).parent)
+        previous = [json.loads(line) for line in (text or "").splitlines() if line.strip()]
+        calls = update(previous)
+        _write_case_calls_locked(path, calls)
+        return calls
 
 
 def attach_llm_calls_to_trace(
@@ -502,10 +497,10 @@ def read_trace_llm_calls(trace: dict[str, Any], case_dir: Path) -> list[dict[str
     ref = trace.get("llm_calls_ref") or (trace.get("artifacts") or {}).get("llm_calls")
     if ref != "llm_calls.jsonl":
         return []
-    path = case_dir / ref
-    if not path.is_file():
-        raise FileNotFoundError(f"missing llm call artifact: {path}")
-    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    text = read_case_llm_jsonl_text(case_dir)
+    if text is None:
+        raise FileNotFoundError(f"missing llm call artifact: {case_dir / ref}")
+    return [json.loads(line) for line in text.splitlines() if line.strip()]
 
 
 def estimate_case_windows(

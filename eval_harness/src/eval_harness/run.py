@@ -265,7 +265,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--pack-zip",
         action="store_true",
-        help="After excel/html build, write <run-id>_share.zip (xlsx+html+cases) for sharing",
+        help="After HTML build, write <run-id>_share.zip using the compact share policy (original HTML + linked attachments)",
     )
     p.add_argument(
         "--skip-preflight",
@@ -378,11 +378,8 @@ def _cases_for_excel_rebuild(
 
 def _llm_rows_from_case_file(case_dir: Path, case_id: str) -> list[dict[str, Any]]:
     """Rebuild llm Excel rows from per-case llm_calls.jsonl (process artifact)."""
-    try:
-        from eval_harness.llm_gateway_ingest import read_case_llm_jsonl_text
-        text = read_case_llm_jsonl_text(case_dir)
-    except Exception:
-        text = None
+    from eval_harness.llm_gateway_ingest import read_case_llm_jsonl_text
+    text = read_case_llm_jsonl_text(case_dir)
     if text is None:
         return []
     rows: list[dict[str, Any]] = []
@@ -971,6 +968,7 @@ def _main(argv, stack) -> int:
                 else:
                     print(f"[case] {case.case_id} llm_calls=0 (no gateway calls for this execution)", flush=True)
             except Exception as e:
+                capture_complete = False
                 print(f"[case] {case.case_id} llm_calls ingest failed: {e!r}", flush=True)
             if local_llm_rows:
                 with _agg_lock:

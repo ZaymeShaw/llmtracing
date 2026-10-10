@@ -7,6 +7,7 @@ owns one worker process group at a time; no X-Eval headers are injected in DSH.
 from __future__ import annotations
 
 import argparse
+import hashlib
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -25,6 +26,7 @@ sys.path.insert(0, str(ROOT / "eval_harness/src"))
 from eval_harness.attribution_lane import LaneLease
 from eval_harness.gateways import LaneSpec, gatewayctl, lane_not_ready
 from eval_harness.query import collect, redact, snapshot_cursor
+from eval_harness.tool_health import classify_tool_result_ex, result_text
 
 
 def save(path: Path, data) -> None:
@@ -43,7 +45,8 @@ def smoke_cases():
         {"case_id": "D03", "turns": [
             "Use the bash tool to run exactly: cat lane_fixture.txt . "
             "Then reply with the file's exact contents. Do not modify any files."],
-         "expected": "DSH_TOOL_RESULT_8675309", "require_tool": "bash"},
+         "expected_contains": "DSH_TOOL_RESULT_8675309", "require_tool": "bash",
+         "expected_tool_output": "DSH_TOOL_RESULT_8675309"},
     ]
 
 
@@ -71,20 +74,32 @@ def worker(job_path: Path) -> int:
     from deepseek_harness import DeepSeekHarness
     status = {"session_id": job["execution_id"], "success": False, "turns": []}
     try:
+        runtime_env = {"DSH_HOME": str(out / "home"), "DSH_TELEMETRY_DISABLED": "1",
+                       "DSH_READY_FILE": str(out / "runtime_ready.json"),
+                       "DSH_BOOT_MODULE": str(checkout / "packages/boot/app-boot/lib/index.js")}
+        cordis = job["cordis"]
+        if job.get("mcp_config"):
+            cordis, mcp_env = insurance_composition(job, out)
+            runtime_env["DSH_INSURANCE_MCP_ENV"] = json.dumps(mcp_env)
+            runtime_env["DSH_REQUIRE_INSURANCE_MCP"] = "1"
         with (out / "notifications.jsonl").open("w") as events:
             def emit(notification):
                 events.write(json.dumps(redact(asdict(notification)), ensure_ascii=False) + "\n")
                 events.flush()
 
-            with DeepSeekHarness(
+            harness = DeepSeekHarness(
                 provider="deepseek-official", model=job["model"], max_tokens=job["max_tokens"],
                 cwd=str(out / "workspace"), runtime_cwd=str(out / "workspace"),
-                session_root=str(out / "sessions"), cordis=job["cordis"],
+                session_root=str(out / "sessions"), cordis=str(cordis),
                 base_url=job["base_url"], api_key=os.environ["DSH_GATEWAY_KEY"],
-                launch_args_override=(job["node"], str(checkout / "packages/examples/jsonrpc-demo/lib/bin.js")),
-                env={"DSH_HOME": str(out / "home"), "DSH_TELEMETRY_DISABLED": "1"},
-                request_timeout_seconds=30, shutdown_timeout_seconds=10,
-            ) as harness:
+                launch_args_override=(job["node"], str(ROOT / "scripts/dsh_jsonrpc_ready.mjs")),
+                env=runtime_env,
+                request_timeout_seconds=job.get("turn_timeout", 300), shutdown_timeout_seconds=10,
+            )
+            try:
+                harness.client.start()
+                status["runtime_ready"] = wait_runtime_ready(out / "runtime_ready.json", timeout=90)
+                harness.start()
                 session = harness.start_session(job["execution_id"])
                 for prompt in job["case"]["turns"]:
                     result = session.run(prompt, on_notification=emit)
@@ -93,11 +108,93 @@ def worker(job_path: Path) -> int:
                     save(out / "sdk_result.json", status)
                     if result.finish_reason != "completed":
                         raise RuntimeError(f"DSH turn ended: {result.finish_reason}")
+                    if not result.final_response.strip():
+                        raise RuntimeError("DSH completed without a visible answer")
+            finally:
+                harness.close()
             status["success"] = True
     except Exception as exc:
         status["error"] = str(exc)
     save(out / "sdk_result.json", status)
     return 0 if status["success"] else 1
+
+
+def wait_runtime_ready(path: Path, timeout: float):
+    deadline = time.monotonic() + timeout
+    while not path.exists():
+        if time.monotonic() >= deadline:
+            raise TimeoutError("DSH plugin tree did not report readiness")
+        time.sleep(0.05)
+    ready = json.loads(path.read_text())
+    if ready.get("ready") is not True:
+        raise RuntimeError(ready.get("error", "DSH plugin tree failed startup"))
+    return ready
+
+
+def insurance_composition(job, out):
+    """Mount the existing stdio insurance MCP, without local model-facing tools."""
+    import yaml
+    checkout = Path(job["checkout"])
+    server = json.loads(Path(job["mcp_config"]).read_text())["mcpServers"]["insurance-tools"]
+    env = {k: str(v) for k, v in server.get("env", {}).items()}
+    env["ITOOLS_AGENT_ID"] = "dsh"
+    class Expression(str):
+        pass
+    class Dumper(yaml.SafeDumper):
+        pass
+    Dumper.add_representer(Expression, lambda dumper, value: dumper.represent_scalar("tag:yaml.org,2002:js", value))
+
+    def plugin(id, path, config=None):
+        target = checkout / "packages" / path / "lib/index.js"
+        if not target.is_file():
+            raise FileNotFoundError(f"DSH plugin needs build: {target}")
+        return {"id": id, "name": str(target), **({"config": config} if config is not None else {})}
+
+    rows = [
+        plugin("sdk", "sdk/server"),
+        plugin("agent", "examples/agent-spine-demo", {
+            "persona": Path(job["agent_prompt"]).read_text(), "workspaceContext": False,
+            "includeRuntimeContext": False, "skills": {"enabled": False},
+            "toolBash": False, "toolJobs": False,
+        }),
+        plugin("llm", "llm/llm-deepseek", {
+            "thinking": "disabled" if job["thinking"] == "off" else "enabled",
+            "reasoningEffort": "off" if job["thinking"] == "off" else "max",
+        }),
+        plugin("sessions", "session/session-persistence-jsonl", {"root": str(out / "sessions")}),
+        plugin("checkpoints", "session/session-checkpoint-policy"),
+        plugin("mcp-insurance", "mcp/mcp-client", {
+            "serverName": "insurance-tools", "transport": "stdio", "command": server["command"],
+            "args": server.get("args", []), "env": Expression("JSON.parse(process.env.DSH_INSURANCE_MCP_ENV)"),
+            "cwd": server.get("cwd", str(out / "workspace")), "failOnStartupError": True,
+            "toolCallTimeoutMs": 60000,
+        }),
+    ]
+    config = out / "insurance.cordis.yml"
+    config.write_text(yaml.dump(rows, Dumper=Dumper, allow_unicode=True, sort_keys=False))
+    return config, env
+
+
+def mcp_health(notifications):
+    """Join native MCP calls/results and classify backend errors separately."""
+    calls, results = {}, []
+    for n in notifications:
+        payload = n.get("payload", {})
+        event = payload.get("event", {})
+        data = event.get("data", {})
+        if event.get("type") == "tool/call" and data.get("name", "").startswith("mcp__insurance-tools__"):
+            calls[(payload.get("sessionId"), data.get("callId"))] = data["name"]
+        if event.get("type") == "tool/result":
+            for block in data.get("message", {}).get("content", []):
+                name = calls.get((payload.get("sessionId"), block.get("toolCallId")))
+                if name and block.get("type") == "tool-result":
+                    kind, reason, upstream = classify_tool_result_ex(result_text(block.get("content")), bool(block.get("isError")))
+                    results.append({"tool": name, "kind": kind, "reason": reason, "upstream": upstream})
+    counts = {k: sum(r["kind"] == k for r in results) for k in ("ok", "neutral", "infra", "upstream", "error")}
+    return {"call_count": len(calls), "result_count": len(results), "counts": counts,
+            "tools": sorted(set(calls.values())), "results": results,
+            "healthy": bool(calls) and len(calls) == len(results) and counts["ok"] > 0
+                       and counts["infra"] == 0 and counts["error"] == 0 and counts["upstream"] == 0}
 
 
 def terminate_group(proc) -> None:
@@ -127,7 +224,10 @@ def run_lane(gateway, cases, args):
             (out / "workspace/lane_fixture.txt").write_text("DSH_TOOL_RESULT_8675309\n")
             job = {"checkout": str(args.dsh_checkout), "node": args.node, "cordis": str(args.cordis),
                    "model": gateway.env["UPSTREAM_MODEL"], "max_tokens": args.max_tokens,
+                   "turn_timeout": getattr(args, "turn_timeout", 300),
                    "base_url": f"http://127.0.0.1:{gateway.port}/v1", "case": case, "execution_id": eid}
+            if getattr(args, "mcp_config", None):
+                job.update(mcp_config=str(args.mcp_config), agent_prompt=str(args.agent_prompt), thinking=args.thinking)
             save(out / "job.json", job)
             cursor = snapshot_cursor(gateway=gateway.name)
             status = {"run_id": args.run_id, "case_id": case["case_id"], "execution_id": eid,
@@ -165,18 +265,24 @@ def run_lane(gateway, cases, args):
                 calls = captured["calls"]
                 status["attribution_ok"] = bool(calls) and all(
                     c.get("case_id") == case["case_id"] and c.get("run_id") == args.run_id
-                    and c.get("execution_id") == eid for c in calls)
+                    and c.get("execution_id") == eid and c.get("case_id_source") == "lane_registry"
+                    and c.get("lane_id") == gateway.name for c in calls)
                 status["success"] &= status["attribution_ok"]
                 final = status.get("turns", [{}])[-1].get("final_response", "") if status.get("turns") else ""
                 if "expected" in case:
                     status["answer_ok"] = final.strip() == case["expected"]
                     status["success"] &= status["answer_ok"]
+                if "expected_contains" in case:
+                    status["answer_ok"] = case["expected_contains"] in final
+                    status["success"] &= status["answer_ok"]
                 if "require_tool" in case:
                     notifications = [json.loads(line) for line in (out / "notifications.jsonl").read_text().splitlines()]
-                    status["tool_ok"] = any(n.get("payload", {}).get("event", {}).get("type") == "tool/call"
-                                            and n["payload"]["event"].get("data", {}).get("name") == case["require_tool"]
-                                            for n in notifications)
+                    status["tool_ok"] = tool_succeeded(notifications, case["require_tool"], case.get("expected_tool_output"))
                     status["success"] &= status["tool_ok"]
+                if job.get("mcp_config"):
+                    notifications = [json.loads(line) for line in (out / "notifications.jsonl").read_text().splitlines()]
+                    status["mcp_health"] = mcp_health(notifications)
+                    status["success"] &= status["mcp_health"]["healthy"]
             except BaseException as exc:
                 blocked = True
                 status["success"], status["error"] = False, str(exc) or type(exc).__name__
@@ -196,26 +302,57 @@ def run_lane(gateway, cases, args):
     return results
 
 
+def tool_succeeded(notifications, name, expected_output=None):
+    """Require a matched successful native tool result, not model-authored text."""
+    calls = set()
+    for notification in notifications:
+        payload = notification.get("payload", {})
+        event = payload.get("event", {})
+        data = event.get("data", {})
+        if event.get("type") == "tool/call" and data.get("name") == name and data.get("callId"):
+            calls.add((payload.get("sessionId"), data["callId"]))
+        if event.get("type") == "tool/result":
+            for block in data.get("message", {}).get("content", []):
+                key = (payload.get("sessionId"), block.get("toolCallId"))
+                if block.get("type") != "tool-result" or key not in calls or block.get("isError"):
+                    continue
+                text = "".join(c.get("text", "") for c in block.get("content", []) if c.get("type") == "text")
+                if expected_output is None or text.strip() == expected_output:
+                    return True
+    return False
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--worker", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--dsh-checkout", type=Path)
     parser.add_argument("--node", default="node")
     parser.add_argument("--cordis", type=Path)
+    parser.add_argument("--mcp-config", type=Path, help="Claude/Pi mcpServers config containing insurance-tools (stdio)")
+    parser.add_argument("--agent-prompt", type=Path, help="Shared business system prompt, required with --mcp-config")
+    parser.add_argument("--thinking", choices=("on", "off"), default="off", help="Insurance MCP composition only")
     parser.add_argument("--lanes", default="dsh_smoke")
     parser.add_argument("--bundle", type=Path, help="JSONL of case_id and turns; default: three smoke cases")
     parser.add_argument("--cases", help="comma-separated case ids")
     parser.add_argument("--run-id", default="dsh_" + datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S"))
     parser.add_argument("--timeout", type=float, default=180)
+    parser.add_argument("--turn-timeout", type=float, default=300, help="SDK turn RPC timeout; case worker is also bounded by --timeout")
     parser.add_argument("--max-tokens", type=int, default=4096)
     args = parser.parse_args()
     if args.worker:
         return worker(args.worker)
     if not args.dsh_checkout:
         parser.error("--dsh-checkout is required")
-    if not re.fullmatch(r"[A-Za-z0-9_-]+", args.run_id) or args.timeout <= 0 or args.max_tokens <= 0:
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", args.run_id) or args.timeout <= 0 or args.turn_timeout <= 0 or args.max_tokens <= 0:
         parser.error("safe run-id and positive timeout/max-tokens required")
     args.dsh_checkout = args.dsh_checkout.resolve()
+    if args.mcp_config:
+        if not args.agent_prompt or not args.bundle or args.cordis:
+            parser.error("--mcp-config needs --agent-prompt and --bundle, and generates its own --cordis")
+        args.mcp_config, args.agent_prompt = args.mcp_config.resolve(), args.agent_prompt.resolve()
+        for path in (args.mcp_config, args.agent_prompt):
+            if not path.is_file():
+                parser.error(f"missing: {path}")
     args.cordis = (args.cordis or args.dsh_checkout / "examples/jsonrpc-agent/cordis.yml").resolve()
     args.output = ROOT / "eval_runs" / args.run_id
     if args.output.exists():
@@ -240,6 +377,14 @@ def main() -> int:
         if reason := lane_not_ready(spec):
             parser.error(reason)
     args.output.mkdir(parents=True)
+    provenance = {"run_id": args.run_id, "case_ids": [c["case_id"] for c in cases],
+                  "max_tokens": args.max_tokens, "case_timeout_seconds": args.timeout,
+                  "turn_timeout_seconds": args.turn_timeout, "lanes": [g.name for g in gateways],
+                  "thinking": args.thinking if args.mcp_config else "composition", "mcp_agent_id": "dsh" if args.mcp_config else None}
+    for label, path in (("bundle", args.bundle), ("agent_prompt", args.agent_prompt), ("mcp_config", args.mcp_config)):
+        if path:
+            provenance[label] = {"path": str(path.resolve()), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+    save(args.output / "inputs.json", provenance)
     with ThreadPoolExecutor(max_workers=len(gateways)) as pool:
         futures = [pool.submit(run_lane, g, cases[i::len(gateways)], args) for i, g in enumerate(gateways)]
         results = [row for future in futures for row in future.result()]

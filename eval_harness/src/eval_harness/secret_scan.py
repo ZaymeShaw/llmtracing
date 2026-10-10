@@ -18,6 +18,7 @@ exit 0 = clean, 3 = findings.
 from __future__ import annotations
 
 import argparse
+import gzip
 import io
 import json
 import re
@@ -178,12 +179,20 @@ class SecretScanner:
                 self._scan_stream(io.BytesIO(data), name)
                 continue
             with zf.open(info) as fh:
-                self._scan_stream(fh, name)
+                if info.filename.lower().endswith(".gz"):
+                    with gzip.GzipFile(fileobj=fh, mode="rb") as uncompressed:
+                        self._scan_stream(uncompressed, name)
+                else:
+                    self._scan_stream(fh, name)
 
     def scan_file(self, path: Path, label: Optional[str] = None) -> None:
         path = Path(path)
         label = label or str(path)
         self.report.files_scanned += 1
+        if path.suffix.lower() == ".gz":
+            with gzip.open(path, "rb") as source:
+                self._scan_stream(source, label)
+            return
         if path.suffix.lower() in ZIP_SUFFIXES and zipfile.is_zipfile(path):
             with zipfile.ZipFile(path) as zf:
                 self._scan_zip(zf, label)

@@ -8,7 +8,6 @@ from eval_harness.wire_turns import observed_turns
 import html
 import json
 import re
-import zipfile
 from pathlib import Path
 from typing import Any, Optional
 
@@ -118,14 +117,8 @@ def _preview(text: str, n: int = 80) -> str:
 
 
 def _load_calls(case_dir: Path) -> list[dict[str, Any]]:
-    try:
-        from eval_harness.llm_gateway_ingest import read_case_llm_jsonl_text
-        text = read_case_llm_jsonl_text(case_dir)
-    except Exception:
-        text = None
-        plain = case_dir / "llm_calls.jsonl"
-        if plain.is_file():
-            text = plain.read_text(encoding="utf-8")
+    from eval_harness.llm_gateway_ingest import read_case_llm_jsonl_text
+    text = read_case_llm_jsonl_text(case_dir)
     if text is None:
         legacy_trace = case_dir / "trace.json"
         if legacy_trace.is_file():
@@ -2039,136 +2032,36 @@ renderDetail();
     return out
 
 
-def _share_manifest(run_dir: Path) -> dict[str, Any]:
-    """Snapshot of what a share zip should contain (for humans + CI checks)."""
-    from datetime import datetime
-    try:
-        from zoneinfo import ZoneInfo
-        now = datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(timespec="seconds")
-    except Exception:
-        now = datetime.now().isoformat(timespec="seconds")
-
-    cases_root = run_dir / "cases"
-    case_ids: list[str] = []
-    n_success = 0
-    n_fail = 0
-    n_missing_trace = 0
-    fail_ids: list[str] = []
-    if cases_root.is_dir():
-        for d in sorted(p for p in cases_root.iterdir() if p.is_dir()):
-            case_ids.append(d.name)
-            tp = d / "trace.json"
-            if not tp.is_file():
-                n_missing_trace += 1
-                fail_ids.append(d.name)
-                continue
-            try:
-                tr = json.loads(tp.read_text(encoding="utf-8"))
-            except Exception:
-                n_missing_trace += 1
-                fail_ids.append(d.name)
-                continue
-            if tr.get("success"):
-                n_success += 1
-            else:
-                n_fail += 1
-                fail_ids.append(d.name)
-
-    def _mtime(name: str) -> Optional[str]:
-        fp = run_dir / name
-        if not fp.is_file():
-            return None
-        return datetime.fromtimestamp(fp.stat().st_mtime).isoformat(timespec="seconds")
-
-    return {
-        "schema_version": "1.0",
-        "run_id": run_dir.name,
-        "packed_at": now,
-        "n_cases": len(case_ids),
-        "n_success": n_success,
-        "n_fail": n_fail,
-        "n_missing_trace": n_missing_trace,
-        "fail_or_missing_ids": fail_ids,
-        "artifacts": {
-            "results.xlsx": _mtime("results.xlsx"),
-            "llm_trace.html": _mtime("llm_trace.html"),
-            "run_meta.json": _mtime("run_meta.json"),
-            "progress.jsonl": _mtime("progress.jsonl"),
-            "console.log": _mtime("console.log"),
-        },
-        "policy": {
-            "rebuild_html_before_pack": True,
-            "atomic_replace": True,
-            "includes": ["results.xlsx", "llm_trace.html", "run_meta.json", "progress.jsonl", "console.log", "share_manifest.json", "cases/**"],
-            "note": "Canonical share zip is always <run_id>_share.zip overwritten only after HTML refresh + atomic rename.",
-        },
-    }
-
-
 def pack_run_zip(run_dir: Path, *, out_zip: Optional[Path] = None) -> Path:
-    """Pack a portable share zip for a finished (or snapshot) run.
+    """Package existing HTML with the shared viewing policy; never rebuild it.
 
-    Guarantees:
-    - rebuilds llm_trace.html from all cases/ before packing
-    - refuses to pack if results.xlsx is missing
-    - writes share_manifest.json (counts + artifact mtimes) into the zip and run dir
-    - atomic replace: write *.zip.tmp then rename over <run_id>_share.zip
-    - if an older share zip exists, keep one backup as <run_id>_share.prev.zip
+    Keep the established rootless ZIP layout and one previous output on replacement.
+    Source calls and logs remain available for analysis and report regeneration.
     """
-    run_dir = Path(run_dir)
-    if not run_dir.is_dir():
-        raise FileNotFoundError(f"run_dir not found: {run_dir}")
-    xlsx = run_dir / "results.xlsx"
-    if not xlsx.is_file():
-        raise FileNotFoundError(f"results.xlsx missing under {run_dir}; rebuild excel before pack-zip")
+    import tempfile
+    from eval_harness.share_zip import pack_share_zip
 
-    out_zip = Path(out_zip) if out_zip else run_dir / f"{run_dir.name}_share.zip"
-    html_path = build_llm_trace_html(run_dir)
-
-    manifest = _share_manifest(run_dir)
-    manifest["artifacts"]["llm_trace.html"] = None
-    try:
-        from datetime import datetime
-        manifest["artifacts"]["llm_trace.html"] = datetime.fromtimestamp(html_path.stat().st_mtime).isoformat(timespec="seconds")
-    except Exception:
-        pass
-    manifest_path = run_dir / "share_manifest.json"
-    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-
-    tmp_zip = out_zip.with_name(out_zip.name + ".tmp")
-    if tmp_zip.exists():
-        tmp_zip.unlink()
-    top_files = (
-        "results.xlsx",
-        "llm_trace.html",
-        "run_meta.json",
-        "progress.jsonl",
-        "console.log",
-        "share_manifest.json",
-    )
-    members: list = []
-    for name in top_files:
-        p = run_dir / name
-        if p.is_file():
-            members.append((p, name))
-    cases = run_dir / "cases"
-    if cases.is_dir():
-        for p in cases.rglob("*"):
-            if p.is_file():
-                members.append((p, str(p.relative_to(run_dir))))
-    # Secret-scan gate: every file going into the zip; raises SecretScanError (no zip written).
-    from eval_harness.secret_scan import gate as _secret_gate
-    _secret_gate([m[0] for m in members], what=f"share zip {out_zip.name}")
-    with zipfile.ZipFile(tmp_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for p, arc in members:
-            zf.write(p, arcname=arc)
-
-    if out_zip.exists():
-        prev = run_dir / f"{run_dir.name}_share.prev.zip"
-        if prev.exists():
-            prev.unlink()
-        out_zip.replace(prev)
-    tmp_zip.replace(out_zip)
+    run_dir = Path(run_dir).resolve()
+    if not (run_dir / "llm_trace.html").is_file():
+        raise FileNotFoundError(f"llm_trace.html missing under {run_dir}; export HTML before packing")
+    out_zip = Path(out_zip).absolute() if out_zip else run_dir / f"{run_dir.name}_share.zip"
+    prev = out_zip.with_suffix(".prev.zip")
+    if out_zip.is_symlink() or prev.is_symlink():
+        raise ValueError("refusing to replace a symlink output")
+    out_zip.parent.mkdir(parents=True, exist_ok=True)
+    # Stage outside the source tree: neither this ZIP nor the preceding ZIP becomes an input.
+    with tempfile.TemporaryDirectory(prefix=".share-build-", dir=run_dir.parent) as tmp:
+        staged = Path(tmp) / "share.zip"
+        pack_share_zip(run_dir, staged, include_root=False,
+                       exclude_paths=(out_zip, prev, run_dir / "share_manifest.json"))
+        if out_zip.exists():
+            out_zip.replace(prev)
+        try:
+            staged.replace(out_zip)
+        except OSError:
+            if not out_zip.exists() and prev.is_file():
+                prev.replace(out_zip)
+            raise
     return out_zip
 
 
@@ -2199,7 +2092,7 @@ if __name__ == "__main__":
 
     ap = argparse.ArgumentParser()
     ap.add_argument("run_dir", type=Path, nargs="?")
-    ap.add_argument("--zip", action="store_true")
+    ap.add_argument("--zip", action="store_true", help="Package existing HTML with the share policy; generate it first if missing")
     ap.add_argument("--from-gateway-log", type=Path, help="Build a wire-only run from gateway jsonl")
     ap.add_argument("--out-run-dir", type=Path, help="Output run dir for --from-gateway-log")
     ap.add_argument("--cases", type=str, default="", help="Comma-separated case ids (default: all tagged)")
@@ -2221,9 +2114,15 @@ if __name__ == "__main__":
         )
         print("wire_run", out)
         print("html", out / "llm_trace.html")
+        if args.zip:
+            print("zip", pack_run_zip(out))
     else:
         if not args.run_dir:
             raise SystemExit("run_dir required unless --from-gateway-log")
-        print("html", build_llm_trace_html(args.run_dir))
+        existing_html = args.run_dir / "llm_trace.html"
+        if args.zip and existing_html.is_file():
+            print("html", existing_html)
+        else:
+            print("html", build_llm_trace_html(args.run_dir))
         if args.zip:
             print("zip", pack_run_zip(args.run_dir))

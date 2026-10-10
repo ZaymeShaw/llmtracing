@@ -62,6 +62,9 @@ def test_claude_allowlist(gw):
 
 def test_pi_allowlist_and_injection_only_local_key(gw, monkeypatch):
     from eval_harness.adapters import pi
+    # Other collected SDK tests may load the real relay .env into this process.
+    # This test is about the isolated gateway fixture, not process overrides.
+    monkeypatch.delenv("LITELLM_MASTER_KEY", raising=False)
     monkeypatch.setattr(pi, "DEFAULT_GATEWAY_ENV", gw / ".env")
     env = pi.case_id_injection_env(
         "PI_A14", build_agent_env("pi", parent=PARENT), execution_id="e1",

@@ -1,5 +1,7 @@
 # DeepSeek Harness 接入 llmtracing 调研
 
+后续进展：2026-10-09 已完成真实 lane 试跑，单轮、多轮、工具往返和双 lane 并发通过；使用其他 harness 的原题 A01/C20/F13、原业务提示词和真实 insurance-tools MCP，10 次模型请求、9 次 MCP 调用完成，均经中转到原百炼模型。接入通过，但 A01 累计保费、C20 条款内容仍有业务缺口；见 [实跑结果与复现](dsh-lane-quickstart.md)。下文保留最初调研范围。
+
 调研日期：2026-10-09。DSH 本地源码：`../dsh/deepseek-harness`，HEAD `99f6f02fec`。本文依据本地实现及官方协议文档；未启动真实模型请求，未完成端到端接入验证。llmtracing 存在未提交的在途改动，以下判断以当前工作区为准。
 
 ## 结论

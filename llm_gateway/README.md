@@ -1,5 +1,9 @@
 # llm_gateway — eval LLM call capture
 
+DeepSeek Harness SDK/CLI lanes: see [DSH lane quickstart](../docs/dsh-lane-quickstart.md).
+Their observer config is `config.litellm.dsh.yaml`; use thinking passthrough and
+the opt-in empty tool-delta identity compatibility flag documented there.
+
 ## Config profiles (switchable)
 
 | File | Role |

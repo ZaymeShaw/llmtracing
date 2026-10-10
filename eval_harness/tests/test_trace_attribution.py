@@ -270,7 +270,7 @@ def test_trace_reference_preserves_frontend_payload(tmp_path: Path):
         assert read_trace_llm_calls(trace, case_dir) == [call]
     assert build_payload(tmp_path / "legacy")["cases"] == build_payload(tmp_path / "reference")["cases"]
     ref_dir = tmp_path / "reference" / "cases" / "A01"
-    (ref_dir / "llm_calls.jsonl").unlink()
+    (ref_dir / "llm_calls.jsonl.gz").unlink()
     with pytest.raises(FileNotFoundError):
         read_trace_llm_calls(json.loads((ref_dir / "trace.json").read_text()), ref_dir)
 

@@ -76,6 +76,26 @@ open eval_runs/my_batch/llm_trace.html
 
 报告展示模型调用、各轮输入输出和首字耗时；同批同题默认看最新尝试，可勾选历史。新增日志后重新导出即可；模型请求之外的本地执行过程不会被中转采集。
 
+新产生的逐题调用归档默认无损写入 `llm_calls.jsonl.gz`，HTML、Excel 和增量导出自动读取；旧明文归档继续兼容，历史目录不自动迁移。完整 JSONL 解压后字节不变，不删字段或历史消息，也不加大小限制。实现边界与真实批次验证见 [无损调用归档](docs/lossless-call-storage.md)。
+
+基础版的 `--zip`、runner 的 `--pack-zip` 和多 harness 的 `product_zip` 已统一使用 share 打包规则。已有 HTML 会原样装包，不在打包时重新生成，也不再要求存在 Excel：
+
+```bash
+./llmtrace report html eval_runs/my_batch --zip
+```
+
+输出仍为 `eval_runs/my_batch/my_batch_share.zip`；再次打包保留一个 `.prev.zip`，新包不包含这些历史包。需要刷新报告时，先运行不带 `--zip` 的 HTML 导出。日志导出形式 `report html --gateway NAME --out DIR --zip` 会先正常生成报告，再应用相同的打包规则。
+
+也可指定输出位置，或从已有完整归档生成离线查看包：
+
+```bash
+./llmtrace report share eval_runs/my_batch --out eval_runs/my_batch-share.zip
+# 也可从已有完整归档生成分享包
+./llmtrace report share eval_runs/my_batch.zip --out eval_runs/my_batch-share.zip
+```
+
+所有原 HTML 按字节保留；页面 `href/src` 链接到的本地附件保留，缺失附件会报错。包内省略未被页面链接的 JSONL、gzip、Excel、CSV/TSV 和调试日志；其他文件沿用原样。原始数据仍在运行目录，继续用于分析和重建。导出复用密钥扫描，并验证保留文件的 SHA256 与 ZIP 校验；清单在包内 `LLMTRACE-SHARE-MANIFEST.json`。没有新增大小限制；显式 `report share --out` 不覆盖已有输出。
+
 ### 4. 扩展：用 adapter 复用框架批跑
 
 需要框架统一加载题库、并发和续跑时，可以接入 adapter。它把框架的 `run_case` 调用连接到你的 harness；模型请求仍经过前面的 LiteLLM 中转，tracing 的采集和查看方式相同。

@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "eval_harness/src"))
 
 from eval_harness.llm_trace_html import build_payload  # noqa: E402
+from eval_harness.llm_gateway_ingest import read_case_llm_jsonl_text
 
 
 def jsonl(path: Path) -> list[dict]:
@@ -101,7 +102,7 @@ def main() -> int:
                     f"attribution={metadata.get('attribution_status')} "
                     f"error={metadata.get('error')}"
                 )
-            calls = jsonl(case_dir / "llm_calls.jsonl")
+            calls = [json.loads(line) for line in (read_case_llm_jsonl_text(case_dir) or "").splitlines() if line.strip()]
             calls_by_channel[channel] += len(calls)
 
             execution_id = metadata.get("execution_id")

@@ -8,7 +8,6 @@ model_list:
       api_key: os.environ/UPSTREAM_API_KEY
       drop_params: false
       num_retries: 0
-      allowed_openai_params: [reasoning_effort]
 
 litellm_settings:
   drop_params: false

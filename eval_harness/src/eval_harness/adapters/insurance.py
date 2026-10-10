@@ -66,13 +66,8 @@ def _rebuild_live_summary(cases_root: Path) -> list[dict[str, Any]]:
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             continue
-        n_calls = 0
-        try:
-            _llm_txt = read_case_llm_jsonl_text(case_dir)
-            if _llm_txt:
-                n_calls = sum(1 for line in _llm_txt.splitlines() if line.strip())
-        except OSError:
-            n_calls = 0
+        _llm_txt = read_case_llm_jsonl_text(case_dir)
+        n_calls = sum(1 for line in (_llm_txt or "").splitlines() if line.strip())
         answer = str(meta.get("answer") or "")
         rows.append(
             {
@@ -641,13 +636,8 @@ def _run_live_batch(
                     prev_meta = None
                     prev_ok = False
             if prev_ok and prev_meta is not None:
-                n_calls = 0
-                try:
-                    _llm_txt = read_case_llm_jsonl_text(case_dir)
-                    if _llm_txt:
-                        n_calls = sum(1 for line in _llm_txt.splitlines() if line.strip())
-                except Exception:
-                    n_calls = 0
+                _llm_txt = read_case_llm_jsonl_text(case_dir)
+                n_calls = sum(1 for line in (_llm_txt or "").splitlines() if line.strip())
                 _append_summary(
                     {
                         "case_id": ins_id,

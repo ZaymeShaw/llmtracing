@@ -1,5 +1,11 @@
 # Eval artifact disk slim
 
+> Legacy cleanup script, not the current lossless default. Its `--apply` defaults
+> can delete mapped streams and failed-attempt archives without proving lossless
+> reconstruction. Do not use those deletions for the user's lossless-only policy.
+> New case call archives now use verified gzip directly at write time; existing
+> files are preserved. See [lossless call storage](lossless-call-storage.md).
+
 ## What `llm_trace.html` depends on
 
 | Phase | Needs on disk |
@@ -12,7 +18,7 @@
 
 ## Safe vs unsafe
 
-**Safe (script default):**
+**Legacy script actions (not all lossless):**
 
 - Delete `stream_turnN.jsonl` when `stream.jsonl` exactly matches harness `concat_streams` reconstruction.
 - Delete `stream_pi.jsonl` when byte-identical to `stream.jsonl`.

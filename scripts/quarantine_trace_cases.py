@@ -29,6 +29,9 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "eval_harness/src"))
+from eval_harness.llm_gateway_ingest import read_case_llm_jsonl_text
+
 TZ = ZoneInfo("Asia/Shanghai")
 
 
@@ -53,10 +56,11 @@ def _user_texts(record: dict) -> list[str]:
 
 
 def _load_calls(path: Path) -> list[dict]:
-    if not path.is_file():
+    text = read_case_llm_jsonl_text(path.parent)
+    if text is None:
         return []
     calls: list[dict] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in text.splitlines():
         line = line.strip()
         if not line:
             continue

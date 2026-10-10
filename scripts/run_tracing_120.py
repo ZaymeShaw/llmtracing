@@ -319,7 +319,7 @@ def run_opencode(root, stage, cases, env):
     # Reuse the public query/export path. Keep every attempt in HTML for history.
     report_rc = monitored([sys.executable, str(ROOT / 'llmtrace'), 'query', 'calls',
                            '--gateway', OPENCODE_GATEWAY, '--run-id', run_id, '--include-rotated',
-                           '--html', str(out), '--format', 'pairs'], root, stage, env, out / 'export.log')
+                           '--html', str(out), '--format', 'table'], root, stage, env, out / 'export.log')
     statuses = [json.loads(p.read_text()) for p in (out / 'cli').glob('*/*/status.json')]
     errors = opencode_capture_errors(statuses, data.get('calls', []), cases)
     if report_rc or not (out / 'llm_trace.html').is_file():

@@ -25,8 +25,8 @@ def test_openai_observer_preserves_thinking_in_wire_extra_body(monkeypatch, thin
                        extra_body={"vendor_option": 7})
     _apply_thinking_policy(data, "completion")
     assert "thinking" not in data  # must not become an OpenAI SDK keyword
-    assert data["extra_body"] == {"vendor_option": 7, "thinking": {"type": thinking}}
-    assert data["reasoning_effort"] == "max"
+    assert data["extra_body"] == {"vendor_option": 7, "thinking": {"type": thinking}, "reasoning_effort": "max"}
+    assert "reasoning_effort" not in data
 
 
 def test_anthropic_observer_keeps_native_thinking(monkeypatch):
@@ -62,15 +62,19 @@ def test_observer_thinking_reaches_openai_transport(monkeypatch):
         async with AsyncOpenAI(api_key="synthetic", base_url="http://fixture.test/v1",
                                http_client=httpx.AsyncClient(transport=httpx.MockTransport(endpoint))) as client:
             for mode in ("enabled", "disabled"):
-                data = _openai_req(thinking={"type": mode}, reasoning_effort="max", max_tokens=42)
+                data = _openai_req(thinking={"type": mode}, max_tokens=42)
+                if mode == "enabled":
+                    data["reasoning_effort"] = "max"
                 _apply_thinking_policy(data, "completion")
                 data.pop("metadata")
                 data["model"] = "openai/deepseek-fixture"
-                await litellm.acompletion(**data, allowed_openai_params=["reasoning_effort"], client=client)
+                await litellm.acompletion(**data, client=client)
 
     asyncio.run(run())
     assert [r["thinking"] for r in received] == [{"type": "enabled"}, {"type": "disabled"}]
-    assert all(r["reasoning_effort"] == "max" and r["max_tokens"] == 42 for r in received)
+    assert received[0]["reasoning_effort"] == "max"
+    assert "reasoning_effort" not in received[1]
+    assert all(r["max_tokens"] == 42 for r in received)
     assert all("extra_body" not in r for r in received)
 
 

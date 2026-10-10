@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import shutil
 import sys
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -86,6 +87,20 @@ def fake_case(**kwargs):
     )
 
 
+def test_failed_call_archive_cannot_report_case_success(checkout, monkeypatch):
+    monkeypatch.setattr(claude, "run_case", fake_case)
+
+    def fail_write(*args, **kwargs):
+        raise OSError("simulated disk full")
+
+    monkeypatch.setattr(run, "write_case_llm_jsonl", fail_write)
+    config = checkout / "eval_harness/configs/runs/claude.yaml"
+    assert run.main(["--config", str(config), "--all", "--run-id", "write-failure", "--skip-preflight"]) == 2
+    trace = json.loads((checkout / "eval_runs/write-failure/cases/A01/trace.json").read_text())
+    assert trace["success"] is False
+    assert trace["error"] == "llm_trace_missing_or_incomplete"
+
+
 @pytest.mark.parametrize("name,module,bin_key", [("claude", claude, "claude_bin"), ("pi", pi, "pi_bin")])
 def test_cli_adapters_dispatch_and_produce_reports(checkout, monkeypatch, name, module, bin_key):
     calls = []
@@ -96,13 +111,17 @@ def test_cli_adapters_dispatch_and_produce_reports(checkout, monkeypatch, name, 
 
     monkeypatch.setattr(module, "run_case", invoke)
     config = checkout / "eval_harness/configs/runs" / f"{name}.yaml"
-    assert run.main(["--config", str(config), "--all", "--run-id", "test", "--skip-preflight"]) == 0
+    assert run.main(["--config", str(config), "--all", "--run-id", "test", "--skip-preflight", "--pack-zip"]) == 0
     assert calls[0][bin_key] == name
     assert calls[0]["project_cwd"] == checkout / "workspaces" / name
     report = checkout / "eval_runs/test"
     assert (report / "cases/A01/trace.json").is_file()
     assert (report / "results.xlsx").is_file()
     assert (report / "llm_trace.html").is_file()
+    with zipfile.ZipFile(report / "test_share.zip") as archive:
+        assert archive.read("llm_trace.html") == (report / "llm_trace.html").read_bytes()
+        assert "results.xlsx" not in archive.namelist()
+        assert not any(name.endswith(".jsonl") for name in archive.namelist())
     # A repeat in the same batch archives the first execution, keeping both viewable.
     first = json.loads((report / "cases/A01/identity.json").read_text())["execution_id"]
     assert run.main(["--config", str(config), "--all", "--run-id", "test", "--skip-preflight"]) == 0

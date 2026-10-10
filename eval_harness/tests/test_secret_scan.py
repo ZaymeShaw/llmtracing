@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import gzip
 import sys
 import zipfile
 from pathlib import Path
@@ -15,6 +16,24 @@ from eval_harness.secret_scan import SecretScanError, SecretScanner, gate
 
 UP = "sk-upstreamFAKE0123456789abcdef"
 LOCAL = "sk-local-gateway-fake-1"
+
+
+def test_gzip_archives_are_scanned_directly_and_inside_zip(tmp_path):
+    packed = gzip.compress(UP.encode())
+    archive = tmp_path / "llm_calls.jsonl.gz"
+    archive.write_bytes(packed)
+    assert not _scanner().scan_paths([archive]).ok
+    bundle = tmp_path / "bundle.zip"
+    with zipfile.ZipFile(bundle, "w") as z:
+        z.writestr("cases/A01/llm_calls.jsonl.gz", packed)
+    assert not _scanner().scan_paths([bundle]).ok
+
+
+def test_broken_gzip_is_not_treated_as_clean(tmp_path):
+    archive = tmp_path / "llm_calls.jsonl.gz"
+    archive.write_bytes(gzip.compress(b"complete data")[:-5])
+    with pytest.raises(EOFError):
+        _scanner().scan_paths([archive])
 
 
 def _scanner(**kw):

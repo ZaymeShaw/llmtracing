@@ -248,7 +248,7 @@ def check(gateways: list[Gateway], *, universe: Optional[list[Gateway]] = None) 
             if not NAME_RE.fullmatch(g.lane_pool or ""):
                 errors.append(f"{g.name}: invalid LANE_POOL")
             if not g.target_url:
-                warnings.append(f"{g.name}: lane without LANE_TARGET_URL (runner cannot use it)")
+                warnings.append(f"{g.name}: lane without LANE_TARGET_URL (HTTP runners require it; SDK/CLI lanes may omit it)")
             elif not g.target_url.startswith(("http://", "https://")):
                 errors.append(f"{g.name}: LANE_TARGET_URL must be http(s)")
             if g.env.get("LLM_ATTRIBUTION_CONFIG"):
