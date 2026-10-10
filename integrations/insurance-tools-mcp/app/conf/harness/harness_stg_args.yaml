@@ -1,0 +1,6 @@
+# 与生产一致的容量兜底，其他交付开关沿用 common。
+version: harness-v19-stg-circuit
+features:
+  capacity_answer:
+    enabled: true
+    http_503: false

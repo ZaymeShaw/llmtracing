@@ -1,0 +1,14 @@
+# 三环境共用；环境差异只在对应环境文件覆盖。
+capability: product-knowledge
+name: 产品知识问答
+description_for_model: 寿险产品条款/责任/等待期/免责/投保规则问答;产品名三态标准化,条款引用带版本与定位
+execution_modes:
+- direct
+- agent
+risk: LOW
+tools:
+- entity_lookup
+- product_knowledge
+- ask_clarify
+eval: eval/
+gray_switch: 'on'

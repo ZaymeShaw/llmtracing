@@ -1,0 +1,13 @@
+# 三环境共用；环境差异只在对应环境文件覆盖。
+capability: product-compare
+name: 产品对比
+description_for_model: 两款及以上产品多维度对比;逐产品取证、维度对齐、只陈述客观差异(修订五:对比专流程已裁撤,由 Agent 承载)
+execution_modes:
+- agent
+risk: HIGH
+tools:
+- entity_lookup
+- product_knowledge
+- ask_clarify
+eval: eval/
+gray_switch: 'off'

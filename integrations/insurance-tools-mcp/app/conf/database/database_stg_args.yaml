@@ -1,0 +1,9 @@
+# 启用 MySQL 时将 backend 改为 mysql，并填写当前环境密码。
+# 使用原始值，不要 URL 编码；含特殊字符的值请用 YAML 引号包裹。
+backend: sqlite
+mysql_connection:
+  database: insurance_qa_agent_stg
+  user: insurance_qa_agent
+  password: ''
+  host: localhost
+  port: 3306

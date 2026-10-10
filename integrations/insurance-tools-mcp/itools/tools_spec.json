@@ -1,0 +1,208 @@
+{
+ "source": "insurance-qa-agent app/tools/bindings.py AGENT_TOOLS",
+ "tools": [
+  {
+   "name": "product_knowledge",
+   "description": "检索某一个具体产品的条款知识：保险责任、等待期、犹豫期、责任免除、投保规则、理赔责任。\n适用：问某款产品的条款口径。query 写产品名（可口语、简称）加关注点，一次一个产品；多产品客观对比时每款各调用一次。\n仅问“哪个好、性价比、怎么选”且没有客观维度时，先 ask_clarify 再检索。\n不用于：不针对具体产品的办理流程 → general_qa；权益或增值服务 → benefit_info；客户或保单数据 → 对应查询工具。\n名称未锁定时返回待确认候选（AMBIGUOUS）；本轮没有其他可答事实时用候选调用 ask_clarify，不改写问法或换工具重试。\n读结果：reference_content 是参考正文，不是结构化四维条款，有正文仍可能为 PARTIAL，也不保证全部属于该产品；\n召回序号不等于产品版本或条款定位。结果确有 product_version 或 locator 时答案必须携带；\n未提供时不得凭记忆补版本或条款号，也不补造停售日期。",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "query": {
+      "type": "string",
+      "description": "产品名加关注点的自足问题，如“平安福的等待期是多久？”；一次只查一个产品。"
+     }
+    },
+    "required": [
+     "query"
+    ]
+   }
+  },
+  {
+   "name": "benefit_info",
+   "description": "查询权益或增值服务的内容、门槛、使用方式、有效期及资格规则。\n适用：“就医绿通怎么用”“安有护有哪些服务”等权益/服务问题，可一次询问多个权益。\n不用于：某产品的条款口径 → product_knowledge；不针对产品的办理流程 → general_qa；\n客户或保单数据 → customer_search / customer_detail / policy_search / policy_detail。\n客户是否已享有某权益：本工具只给资格规则，不能证明某位客户已享有或符合；当前 customer_detail 未提供该关联，\n结论写“是否已享有未确认”。\n读结果：reference_content 是参考正文，不保证覆盖所有权益；raw_score 是未标定检索得分，recall_method 是召回路径，\n都不是客户资格或置信概率。健康、就医类权益只说明服务内容与办理口径，不构成医疗建议。",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "query": {
+      "type": "string",
+      "description": "包含权益或服务名称及关注点的自足问题，如“就医绿通怎么用？”；可询问多个权益。"
+     }
+    },
+    "required": [
+     "query"
+    ]
+   }
+  },
+  {
+   "name": "general_qa",
+   "description": "检索没有专用工具承接的通用寿险办理问答：理赔材料与流程、保全（退保、复效、地址或受益人变更、保单贷款）、缴费等。\n不用于：某个具体产品的条款口径（含该产品的犹豫期、等待期、责任免除、投保规则、理赔责任）→ product_knowledge；\n权益或增值服务 → benefit_info；客户或保单数据 → 对应查询工具。\n读结果：qa_answer 是召回参考正文，真实接口无评分，不要编造相关度；召回序号不是原问题或稳定 QA ID。\n政策、流程和时效类内容可能调整，回答须提示以保险公司现行官方规定为准。",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "query": {
+      "type": "string",
+      "description": "指代消解后的自足问句，如“犹豫期内退保怎么办理”。"
+     }
+    },
+    "required": [
+     "query"
+    ]
+   }
+  },
+  {
+   "name": "policy_search",
+   "description": "按自然语言条件查找保单，返回匹配保单的搜索页记录（已含保单状态、投被保人、保费、保额、犹豫期、理赔记录等常用字段）。\n适用：列出、筛选、计数名下保单，或读取、比较多张保单的字段。\n不用于：已有保单号查该保单 → policy_detail；无保单号且只针对需要锁定的某一张保单 → run_policy_field_lookup。\nquery 须自足并写全筛选条件（内置解析发送空历史）；条件不支持时返回 AMBIGUOUS 且未执行查询，不得删条件扩大范围重试。\n读结果：polno 是保单号，同一保单号可能有多条记录（险种行）；状态、投保人、被保人等须同号各行一致才能作为保单级结论，险种代码不等于产品名。\ndata.total 为符合查询条件的结果总条数，是匹配条目数而非保单张数；完整页的保单张数使用 execution.distinct_policies；没有该值时明确说明张数未确认。\nsum_ins 为原始险种保额、agg_paid_prem 为累计已交保费、agg_pay_cnt 为累计赔付次数，不替代当前金额或跨险种汇总；\n金额只按原值表达，币种和业务时点未提供时不得补“元/万元/CNY/截至今天”。\n按问题从 data 选择字段作答，field_descriptions 给出字段含义；返回候选集合不保证字段齐全，execution 披露截断、未取全与缺失。\n缺上游业务 user_id 时返回 ERROR，模型不得提供或以客户标识替代。",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "query": {
+      "type": "string",
+      "description": "包含全部筛选条件的自足问题，如“张三名下的保单”“买过年金险的保单”。"
+     },
+     "compact": {
+      "type": "boolean",
+      "description": "默认 true，省略 null 字段（不代表零、否或不存在），只展示搜索页核心字段和问题关注字段；需要本页全部可展示字段时设为 false，不改变查询条件。"
+     },
+     "fields": {
+      "anyOf": [
+       {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "description": "compact 模式下只展示主键和指定字段，英文名或中文名均可；未传时使用默认字段。如 保单状态、被保人姓名、投保人姓名、年缴保费、险种保额、累计已交保费、犹豫期、理赔记录；不改变筛选，也不补查详情。"
+     }
+    },
+    "required": [
+     "query"
+    ]
+   }
+  },
+  {
+   "name": "customer_search",
+   "description": "按自然语言条件查找客户，返回匹配客户的搜索页记录。\n适用：按姓名、手机号、寿险客户号、性别、生日、学历、职业、婚姻、资产、证件、会员或分群标签、保单号或尾号、家庭关系等条件定位、筛选、计数客户。\n不用于：目标是保单本身 → policy_search；已有客户中心ID要完整画像 → customer_detail。\n不支持年龄数值比较或区间、跨年生日区间、地址、排序及未登记字段；任一条件不支持时整条不查询，返回 AMBIGUOUS（不是零命中），\n不得删条件扩大范围。无筛选条件时只在用户明确要求浏览时查询首页。\n询问符合条件的客户数量时直接引用 data.total 作答；data.total 为符合查询条件的客户总数，不是当前页记录数或展示条数；保单数量未知不等于零。\n业务客户号是搜索条件，不等于内部标准标识 customer_id；只知道姓名、手机号或业务客户号时先调用本工具，再用搜索结果返回的 customer_id 查详情：\ndata.records[].clientMainId（兼容 client_main_id、idicm_clientno）即客户中心ID，寿险客户号 clientNo 不是。\n读结果：准客和已成单客户都有客户中心ID，不代表已购保险；姓名（clientName，兼容 searchclientname）只指客户本人；\n嵌套的保单、家庭、权益资料不证明完整关联或已享资格。已返回字段直接按 data 作答，field_descriptions 给出字段含义，不必再次查询。",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "query": {
+      "type": "string",
+      "description": "包含全部筛选条件的自足问题，如“姓张的女性客户”“手机号尾号1234的客户”；业务客户号不能直接作为 customer_detail 的 customer_id。"
+     },
+     "compact": {
+      "type": "boolean",
+      "description": "默认 true，省略 null 字段（不代表零、否或不存在），只展示客户核心资料、保单概况和问题关注字段；需要本页全部源字段时设为 false，不改变查询条件。"
+     },
+     "fields": {
+      "anyOf": [
+       {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "description": "compact 模式下展示主键、姓名和指定字段，英文路径或中文名均可，如 手机号、学历、职业、姓名、生日、VIP、客户等级；未传或全部未识别时使用默认字段；不改变筛选，也不补查详情。"
+     }
+    },
+    "required": [
+     "query"
+    ]
+   }
+  },
+  {
+   "name": "policy_detail",
+   "description": "按保单号查询该保单的详情记录。\n适用：已有完整保单号（P/HP/GP 开头加字母数字，如 P002）或至少三位纯数字尾号；尾号多匹配时返回候选，须确认完整号。\n多张保单已有列表字段直接使用 policy_search；只有确需缺失字段才逐张 policy_detail。\n犹豫期是本保单字段；等待期、免责条款使用 product_knowledge。\n不用于：按自然语言条件搜索多张保单 → policy_search；没有保单号 → policy_search 或 run_policy_field_lookup。\n只能查询用户本轮提供、搜索结果或会话已确认的保单号。\n读结果：按 data.records 的险种记录回答，field_descriptions 给出字段含义；同一保单多行字段冲突时不能合成保单级结论；险种代码不等于产品名。\n金额只按原值表达，例如“原始险种保额120,000.00，币种和业务时点未提供”；不得补“元/万元/CNY/截至今天”，不用累计值冒充当前金额。\nPARTIAL 表示已命中但所问字段缺失；精简省略不等于源数据缺失；EMPTY 表示确实无记录。",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "polno": {
+      "type": "string",
+      "description": "完整保单号（P/HP/GP 开头加字母数字）或至少三位纯数字尾号，不得传自然语言。"
+     },
+     "fields": {
+      "anyOf": [
+       {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "description": "默认视图追加关注字段，英文名或中文名均可，如 保单状态、被保人姓名、投保人姓名、年缴保费、险种保额；只控制展示，不改变取数。"
+     },
+     "compact": {
+      "type": "boolean",
+      "description": "默认 true，省略 null 字段（不代表零、否或不存在），只展示核心字段与关注字段；需要本页全部可展示字段时设为 false。"
+     }
+    },
+    "required": [
+     "polno"
+    ]
+   }
+  },
+  {
+   "name": "customer_detail",
+   "description": "按客户中心ID查询客户详情。\n一个客户传 customer_id，返回完整画像；多个客户传 customer_ids（最多 100 个），只返回客户中心ID、姓名、性别、年龄\n四项基本候选，其余字段未查询。需要其中某人完整画像且目标明确时，再用其 customer_id 单独查询。\n姓名、手机号、寿险客户号不能当客户中心ID，先用 customer_search 定位；多个候选且目标不明确时先消歧，不擅自选择。\n读结果：birthday 是生日相关日期，不能按年份重算年龄；字段名含 Cipher 仅为接口命名，值可读即按原值展示，不自行解密；\n空值不等于零或否，会员等级不证明已享某项权益；不补造金额单位或时点。",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "customer_id": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "description": "单个客户的客户中心ID（customer_search 结果中的 clientMainId）。"
+     },
+     "compact": {
+      "type": "boolean",
+      "description": "默认 true，省略 null 字段（不代表零、否或不存在），只展示核心信息；false 保留全部原值。"
+     },
+     "fields": {
+      "anyOf": [
+       {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "description": "默认视图追加关注字段，英文路径或中文名均可，只控制展示。"
+     },
+     "customer_ids": {
+      "anyOf": [
+       {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "description": "多个客户的客户中心ID，最多 100 个；只返回基本候选。"
+     }
+    },
+    "required": []
+   }
+  }
+ ]
+}

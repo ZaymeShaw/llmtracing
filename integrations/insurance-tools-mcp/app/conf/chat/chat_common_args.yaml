@@ -1,0 +1,37 @@
+# 三环境共用；环境差异只在对应环境文件覆盖。
+version: chat-v7
+trusted_body_user_id: false
+session_turn_wait_timeout_s: 5.0
+# 请求期限自动取本轮整轮上限 + 启动/发送/清理预留，不再手工对齐。
+request_cleanup_reserve_s: 30.0
+setup_timeout_s: 10.0
+state_operation_timeout_s: 2.0
+cleanup_timeout_s: 3.0
+send_timeout_s: 5.0
+max_active_requests: 24
+max_active_per_user: 4
+max_model_requests: 16
+# 按剩余 answer 预算等待，同时限制槽位排队为 25s（复检建议 20～30s）。
+# 拒绝后继续交付已有工具结果；不缩短整轮执行预算。0 禁止等待，null 为旧兼容口径。
+model_slot_wait_s: 25.0
+graceful_shutdown_s: 32.0  # 25s交付 + 5s发送 + 2s调度余量；另有完整5s通知期
+# SIGTERM 起计：先撤销就绪并保持监听，给在途轮次快照交付及传输补终态留时间。
+shutdown_readiness_delay_s: 5.0
+shutdown_answer_timeout_s: 20.0
+shutdown_finalize_reserve_s: 8.0
+shutdown_delivery_timeout_s: 25.0
+
+# 首帧/展示为启动配置，修改后重启；进度关闭不关闭首帧硬约束。
+pre_stream_policy: early_sse
+progress:
+  enabled: true
+  stage_messages_enabled: true
+  tool_messages_enabled: true
+first_visible:
+  timeout_s: 8.0
+  send_reserve_s: 0.5
+  fallback_status_enabled: true
+  on_timeout: null
+first_visible_observability:
+  metrics_enabled: true
+  breach_log_enabled: true

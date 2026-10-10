@@ -1,0 +1,19 @@
+{
+  "mcpServers": {
+    "insurance-tools": {
+      "command": "/absolute/path/to/llmtracing/integrations/insurance-tools-mcp/.venv/bin/python",
+      "args": [
+        "-m",
+        "itools"
+      ],
+      "env": {
+        "ENV_TYPE": "dev",
+        "ITOOLS_AGENT_ID": "pi",
+        "ITOOLS_USER_ID": "1050900009",
+        "ITOOLS_EMPNO": "1050900009",
+        "ITOOLS_AGENTNO": "1050900009"
+      },
+      "directTools": true
+    }
+  }
+}

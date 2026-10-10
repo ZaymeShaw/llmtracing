@@ -1,0 +1,116 @@
+# 三环境共用；环境差异只在对应环境文件覆盖。
+# v15：删去 direct_llm_light（形态⑤ 直达清单 LLM 加工已整体下线，2026-09-20）。
+version: harness-v22
+no_progress_limit: 3
+after_hooks_budget_s: 2.0
+# CI-07：模型视图固定开启，仅改变模型输入；原始结果、证据池和卡片不变。
+output_shaping:
+  max_chars: 8000
+  item_chars: 1200
+  max_input_chars: 262144
+  max_references: 512
+  max_records: 64
+  max_nodes: 8192
+  max_containers: 64
+tracing_enabled: false
+timeouts_enabled: true
+tool_call_limits_enabled: true
+sse_event_queue_maxsize: 16
+sse_heartbeat_s: 10
+max_consecutive_open_clarify_rounds: 2
+# 单轮最多执行 10 分钟；外层 Chat 请求额外预留初始化和收尾时间。
+turn_hard_ceiling_s: 600
+agentos_turn_hard_ceiling_s: 600
+# 工具停止外呼后留出模型准入（primary 6.5s）和答案收尾余量。
+history_window:
+  max_runs: 5
+  max_chars: 8000
+  max_answer_chars: 600
+  customer_id_pattern: (?<![A-Za-z0-9_-])(?:C[_-]?\d{6,62}|(?:KH|LIFE)[_-]?\d[A-Z0-9_-]{2,61})(?![A-Za-z0-9_-])
+  # 业务查询条件仍采用原窗口；不向后端发送模型摘要。
+  policy_context_max_chars: 30000
+profiles:
+  direct:
+    # 保单详情 → 产品解析 → 条款检索；每个真实 RPC 仍统一计额。
+    max_rpc_calls: 3
+    latency_target_s: 3
+  workflow:
+    max_rpc_calls: 16
+    latency_target_s: 8
+  agent:
+    # 2026-09-28 Owner：适度放宽正常运行预算，硬上限仍有限。
+    # H-06 开启后 10 次中预留 2 次整理已有工具结果，不增加整轮 600s 上限。
+    max_llm_calls: 10
+    max_tool_calls: 12
+    max_same_tool_calls: 4
+    max_rag_tool_calls: 6
+    max_llm_tokens: 360000
+    max_rpc_calls: 20
+    latency_target_s: 15
+admission_ms:
+  primary_llm: 6500
+  lite_llm: 5500
+  tool_call: 3500
+# 连续连接失败熔断；冷却后仅一条普通请求探测，无后台模型调用。
+model_circuit:
+  failure_threshold: 3
+  cooldown_s: 60.0
+# Optional customer confirmation; tune from measured staging latency.
+customer_confirmation_timeout_s: 3.0
+model_timeout_s:
+  primary: 15
+  lite: 10
+
+# DL-05固定请求快照超时路径，旧timeout_snapshot布尔输入忽略；其余交付features默认值不变。
+# 显式关闭父开关会级联关闭依赖子项并记录日志；遗漏依赖/非法类型仍校验失败：
+# BE-02预算控制固定开启；citation_l2 置 on 依赖 answer_ladder.enabled=true；
+# AV-01容量交付独立启用，不联动全面答案阶梯；prd覆盖为200信封。
+#   citation_l2 支持原始 fact_refs（模型视图固定开启）。
+features:
+  # TS-03: 空列表只观察；实际误用审阅后逐项启用 policy_search/customer_search/policy_shape。
+  selection_redirects: []
+  answer_ladder:
+    enabled: false
+  # BE-04：准入/真实计额已统一，无运行期开关；旧boolean输入仅兼容忽略。
+  # BE-03：无进展守卫固定开启，旧no_progress_guard布尔输入忽略；阈值仍由no_progress_limit配置。
+  # E-04：固定 instructions；动态任务/实体摘要移至本轮输入
+  static_system_prompt: true
+  capacity_answer:
+    enabled: false
+    # 开启 enabled 时必须显式填写 http_503: false（200）或 true（503 过渡）。
+    # 公共配置不预填，避免仅开启 enabled 时隐式选择 HTTP 协议。
+  # CI-07 模型视图固定开启；旧 tool_output_shaping.mode 输入兼容归一化为 on。
+  citation_l2: false
+  supersedes_preview: false
+
+# DL-05 两个对话入口统一从硬顶扣除一次交付预留；工具收尾预留另由BE-02管理。
+answer_reserve_s: 2.0
+excerpt_policy:
+  quantitative_terms: ["免费", "全额", "半价", "终身", "永久", "百分之", "一半", "至少", "至多"]
+  entity_terms: ["退保", "现金价值", "保费", "重疾", "既往症", "医保", "保障", "等待期", "保单", "保险", "产品", "合同", "条款", "客户", "被保人", "投保人", "被保险人", "理赔", "赔付", "赔偿", "权益", "责任", "资格", "疾病", "住院", "投保", "生效", "失效", "赔", "缴费", "交费"]
+  assertion_terms: ["仅", "须", "方可", "仅退", "仅承保", "仅限", "限于", "不在", "除外", "不承担", "不予", "无须", "上限", "不适用", "不超过", "最多", "免收", "已结束", "可以", "可享", "能够", "有权", "不能", "无需", "不得", "必须", "应当", "有资格", "符合", "满足", "适用", "有效", "失效", "生效", "终止", "豁免", "承保", "不保", "拒赔", "免赔", "赔付", "赔偿", "不赔", "给付", "可赔", "能赔", "获赔", "涵盖", "覆盖", "享受", "资格", "包含", "保障", "受理", "可用"]
+  topics:
+    claims_process: ["理赔流程", "理赔材料", "申请理赔", "理赔申请"]
+    policy_download: ["保单下载", "下载保单", "电子保单"]
+    contact_update: ["联系方式", "联系电话", "联系地址"]
+    payment_process: ["缴费流程", "交费流程", "续期缴费"]
+  query_fillers: ["请问", "请介绍", "介绍", "告诉我", "帮我", "我想了解", "如何", "怎么", "怎样", "办理", "查询", "修改", "需要什么", "需要哪些", "需要", "有什么", "是什么", "的", "操作", "流程", "步骤", "材料", "说明", "一般", "通用", "请", "了解", "以及"]
+  max_scan_chars: 8000
+  max_entries: 64
+  max_false_positive_rate: 0.05
+  max_false_negative_rate: 0
+  scan_p95_ms: 5
+
+# H-06：软限停止新增取数，预留模型整理；硬限纯内存阶梯交付。
+budget_controller:
+  reserve_calls: 2
+  soft_token_ratio: 0.85
+  finalize_reserve_s: 25.0
+
+# H-12: request-copy recovery only; at most one retry per turn.
+context_recovery:
+  enabled: true  # 可显式关闭剪枝重试与溢出专属状态保留；关闭后仍交付已有失败兜底。
+  excerpt_chars: 1200
+  max_input_chars: 1048576
+  max_messages: 512
+  max_facts: 1024

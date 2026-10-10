@@ -1,0 +1,32 @@
+# 三环境共用；环境差异只在对应环境文件覆盖。
+version: routes-benefit-service-v2
+anchors:
+  positive:
+  - type: exact
+    value: 就医绿通权益有哪些服务
+    action: DIRECT_RAG
+    tool: benefit_info
+  - type: regex
+    value: 安有医|安有护|臻享家医|御享国医|平安居家|高端康养|就医通|家族办公室|家办|私董保健医
+    action: DIRECT_RAG
+    tool: benefit_info
+  - type: exact
+    value: 就医绿通怎么预约
+    action: DIRECT_RAG
+    tool: benefit_info
+  - type: exact
+    value: 在线问诊怎么预约
+    action: DIRECT_RAG
+    tool: benefit_info
+  - type: exact
+    value: 特色体检有哪些服务
+    action: DIRECT_RAG
+    tool: benefit_info
+  - type: exact
+    value: 居家康养服务介绍
+    action: DIRECT_RAG
+    tool: benefit_info
+  negative:
+  - type: regex
+    value: (产品|保险|条款|等待期|免责|保费|保额|现金价值|保单|对比|比较|区别|哪个好|怎么选|值得买|我的|客户|被保人|投保人|有资格|符合资格|能否享有|可以享受|能享受|能享有|是否享有|已享有|报销|免费|收费|资格|能否|能不能|可不可以)
+    action: AGENT

@@ -1,0 +1,12 @@
+# 三环境共用；环境差异只在对应环境文件覆盖。
+capability: general-qa
+name: 通用问答兜底
+description_for_model: 寿险通用问题兜底(理赔/保全/犹豫期/复效等);只基于召回 QA 对作答,低置信如实告知
+execution_modes:
+- direct
+- agent
+risk: LOW
+tools:
+- general_qa
+eval: eval/
+gray_switch: 'on'

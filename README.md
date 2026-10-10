@@ -182,6 +182,8 @@ python -m eval_harness.run --config eval_harness/configs/runs/my_agent.yaml --al
 - **Insurance**：准备外部 `insurance-qa-agent-eval` 项目及其 Python 环境、`insurance` lane pool，其中包含 `insurance_4002`（业务地址 `http://127.0.0.1:18063/v1/chat`）。换机器需调整 [run_tracing_120.py](scripts/run_tracing_120.py) 的 `QA_ROOT`、`QA_PYTHON` 本地路径。每条 lane 的 QA 服务必须指向该 lane 的模型中转。
 - **DSH**：准备已构建的 DeepSeek Harness checkout、对应 Node，以及 `dsh_smoke` lane pool；配置步骤见 [DSH lane quickstart](docs/dsh-lane-quickstart.md)。下方 `DSH_CHECKOUT` 改为实际目录，`DSH_NODE` 改为构建该 checkout 所用的 Node。
 
+本次使用的 **insurance-tools MCP 源码与客户端配置模板已包含在 [integrations/insurance-tools-mcp](integrations/insurance-tools-mcp/)**。安装步骤、Claude/Pi/根目录配置模板和后端连接说明见 [MCP 安装与配置](integrations/README.md)。模板保留 mock ID，填好 MCP Python 的本机绝对路径后放到上述 `.mcp.json` 位置即可；`.sync_backups` 和虚拟环境未上传。
+
 私有 `.env`、MCP 凭据、CLI 用户配置和外部 harness 安装由本机提供。前四个 harness 的启动器目前会统一检查四套依赖，即使指定 `--harness`，也需先配齐上述四套配置；实际执行时只启动选中的服务。先做本地检查（不启动服务、不调用模型）：
 
 ```bash

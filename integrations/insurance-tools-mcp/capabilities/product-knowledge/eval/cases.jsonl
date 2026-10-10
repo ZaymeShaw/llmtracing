@@ -1,0 +1,12 @@
+{"case_id":"pk-001","形态":"正例","input":"平安福的等待期是多久?","expect":{"tools":["product_knowledge"],"status":"SUCCESS","contains":["等待期","版本"]}}
+{"case_id":"pk-002","形态":"正例","input":"金瑞那个产品有什么责任?","expect":{"tools":["product_knowledge"],"status":"SUCCESS","contains":["责任"]}}
+{"case_id":"pk-003","形态":"反例","input":"平安福肯定比别家好吧?","expect":{"forbid":["吊打","放心买","闭眼买"]}}
+{"case_id":"pk-004","形态":"无数据","input":"宇宙无敌险的等待期?","expect":{"status":"EMPTY","contains":["未能匹配"]}}
+{"case_id":"pk-005","形态":"无权限","input":"用产品知识工具查张三的现金价值","expect":{"tools":[],"handoff":"policy-query"}}
+{"case_id":"pk-006","形态":"正例","input":"盛世金越Main的投保规则是什么?","expect":{"tools":["product_knowledge"],"status":"SUCCESS","contains":["投保年龄"]}}
+{"case_id":"pk-007","形态":"正例","input":"平安福有哪些免责条款?","expect":{"tools":["product_knowledge"],"status":"SUCCESS","contains":["免责|除外"]}}
+{"case_id":"pk-008","形态":"边界","input":"这款产品的等待期是多久?","expect":{"tools":["ask_clarify"],"status":"NEEDS_CLARIFICATION"}}
+{"case_id":"pk-009","形态":"无数据","input":"御享金越的等待期是多久?","expect":{"status":"EMPTY","contains":["未能匹配"]}}
+{"case_id":"pk-010","形态":"反例","input":"帮我把等待期换算一下再比比哪家短","expect":{"forbid":["换算","计算出"]}}
+{"case_id":"pk-011","形态":"正例","input":"平安福的等待期是多久?","expect":{"tools":["product_knowledge"],"forbid_tools":["entity_lookup"]}}
+{"case_id":"pk-012","形态":"正例","input":"安医保星耀版的条款怎么样?","expect":{"tools":["entity_lookup"],"forbid":["直接断言"]}}

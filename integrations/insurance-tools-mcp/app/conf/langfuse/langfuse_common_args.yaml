@@ -1,0 +1,11 @@
+# 启动冻结；连接信息仅允许放在当前环境文件，不从公共层继承。
+name_prefix: agentic-insurance-qa-agent
+tags: [统一智能体]
+capture_content: false
+sample_rate: 1.0
+max_content_chars: 4000
+max_queue_size: 2048
+max_export_batch_size: 128
+schedule_delay_ms: 1000
+export_timeout_s: 3.0
+shutdown_timeout_ms: 5000

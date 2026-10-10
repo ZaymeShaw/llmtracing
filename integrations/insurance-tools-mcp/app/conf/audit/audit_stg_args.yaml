@@ -1,0 +1,4 @@
+# 仅维护当前环境差异；与同组 common 配置合并。
+sink:
+  path: var/stg/turn-audit.jsonl
+spool_path: var/stg/turn-audit.spool.jsonl

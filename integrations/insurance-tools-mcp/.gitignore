@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+.sync_staging_*/
+.sync_failed_*/
+.sync_backups/
+SYNC_STATE.json
+.env
+.env.*
+!.env.example

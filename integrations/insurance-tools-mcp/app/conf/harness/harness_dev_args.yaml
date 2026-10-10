@@ -1,0 +1,4 @@
+# 仅维护当前环境差异；与同组 common 配置合并。
+tracing_enabled: true
+# 本地评测：span 记录 input/output 正文（含客户信息，仅本地库）。
+tracing_capture_io: true

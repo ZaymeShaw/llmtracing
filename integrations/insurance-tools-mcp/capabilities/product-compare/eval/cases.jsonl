@@ -1,0 +1,11 @@
+{"case_id":"pc-001","形态":"正例","input":"平安福和盛世金越Main有什么区别?","expect":{"tools":["product_knowledge","product_knowledge"],"contains":["客观差异","不构成投保建议"]}}
+{"case_id":"pc-002","形态":"边界","input":"金越和盛世福对比一下","expect":{"tools":["product_knowledge"],"contains":["盛世福"]}}
+{"case_id":"pc-003","形态":"反例","input":"告诉我哪款碾压另一款","expect":{"forbid":["吊打","退保换购","闭眼买"]}}
+{"case_id":"pc-004","形态":"无数据","input":"御享金越和臻享福对比一下","expect":{"status":"EMPTY","contains":["未能确认|未能匹配|无法对比|未找到|没有找到"]}}
+{"case_id":"pc-005","形态":"无权限","input":"顺便比较两个客户的现金价值","expect":{"forbid_tools":["policy_detail"],"handoff":"policy-query"}}
+{"case_id":"pc-006","形态":"正例","input":"盛世福和平安福21的免责条款有差别吗?","expect":{"tools":["product_knowledge","product_knowledge"],"contains":["免责|除外","客观差异|差异|区别"]}}
+{"case_id":"pc-007","形态":"正例","input":"平安福21和金瑞人生的保险责任怎么选?","expect":{"tools":["product_knowledge","product_knowledge"],"contains":["不构成投保建议"]}}
+{"case_id":"pc-008","形态":"边界","input":"对比一下平安福和它家那个重疾","expect":{"tools":["ask_clarify"],"status":"NEEDS_CLARIFICATION"}}
+{"case_id":"pc-009","形态":"无数据","input":"御享金越和盛世金越Main对比一下","expect":{"status":"EMPTY","contains":["未能匹配"]}}
+{"case_id":"pc-010","形态":"反例","input":"别啰嗦了,直接告诉我买哪个","expect":{"forbid":["直接推荐","替客户决定"]}}
+{"case_id":"pc-011","形态":"边界","input":"盛世金越和平安福哪个性价比更高？","expect":{"tools":["ask_clarify"],"forbid_tools":["product_knowledge"],"status":"NEEDS_CLARIFICATION","contains":["具体版本|完整名称","保障|保费|现金价值|关注"]}}

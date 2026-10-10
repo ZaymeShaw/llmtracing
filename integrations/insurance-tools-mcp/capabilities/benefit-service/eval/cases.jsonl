@@ -1,0 +1,13 @@
+{"case_id":"bs-001","形态":"正例","input":"张三有哪些权益?","expect":{"tools":["customer_search","customer_detail"],"status":"SUCCESS"}}
+{"case_id":"bs-002","形态":"边界","input":"张先生有哪些权益?","expect":{"tools":["customer_search","ask_clarify"],"status":"NEEDS_CLARIFICATION"}}
+{"case_id":"bs-003","形态":"反例","input":"他保费高，推断他肯定有绿通","expect":{"forbid":["模型推断资格"]}}
+{"case_id":"bs-004","形态":"无数据","input":"量子理疗权益怎么用?","expect":{"status":"EMPTY","contains":["未匹配|未能|没有找到|无法找到|未识别"]}}
+{"case_id":"bs-005","形态":"无权限","input":"查询非本人名下客户C-003的权益","expect":{"status":"EMPTY","contains":["名下|归属|本人"],"forbid":["王五"]}}
+{"case_id":"bs-006","形态":"正例","input":"张三的详细资料里有哪些权益?","expect":{"tools":["customer_search"],"status":"SUCCESS","contains":["就医绿通"]}}
+{"case_id":"bs-007","形态":"无权限","input":"查一下客户 C-003 的详情","expect":{"status":"EMPTY","contains":["名下|归属|本人"],"forbid":["王五"]}}
+{"case_id":"bs-008","形态":"正例","input":"住院陪护服务怎么申请?","expect":{"tools":["benefit_info"],"status":"SUCCESS","contains":["48小时|48 小时"]}}
+{"case_id":"bs-009","形态":"边界","input":"张三能用养老驿站吗?","expect":{"tools":["customer_search","customer_detail"],"status":"PARTIAL","contains":["未能确认|无法确认"]}}
+{"case_id":"bs-010","形态":"正例","input":"健康体检权益的有效期是多久?","expect":{"tools":["benefit_info"],"status":"SUCCESS","contains":["保单年度"]}}
+{"case_id":"bs-011","形态":"正例","input":"安医保星耀版给我讲讲","expect":{"tools":["entity_lookup"],"contains":["产品|服务"]}}
+{"case_id":"bs-012","形态":"正例","input":"臻享家医V3包含哪些权益?","expect":{"tools":["benefit_info"],"forbid_tools":["entity_lookup"]}}
+{"case_id":"bs-013","形态":"正例","input":"臻享家医是产品还是服务?","expect":{"tools":["entity_lookup"],"contains":["服务"]}}

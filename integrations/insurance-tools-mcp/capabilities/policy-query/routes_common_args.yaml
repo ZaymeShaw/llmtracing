@@ -1,0 +1,5 @@
+# 三环境共用；环境差异只在对应环境文件覆盖。
+version: routes-policy-query-v0
+anchors:
+  positive: []
+  negative: []

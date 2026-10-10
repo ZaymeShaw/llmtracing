@@ -1,0 +1,6 @@
+# AV-01：容量不足独立交付可用信封，不联动全面答案阶梯或引用开关。
+version: harness-v19-prd-circuit
+features:
+  capacity_answer:
+    enabled: true
+    http_503: false

@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "insurance-tools-mcp"
+version = "0.1.0"
+description = "把 7 个保险问答查询工具以 MCP 暴露给任意 harness(独立于原问答工程)"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    # 契约与配置直接使用的建模库
+    "pydantic>=2.13,<3",
+    # 下游 HTTP 调用
+    "httpx>=0.28,<1",
+    # app/conf/*.yaml 装载
+    "pyyaml>=6.0",
+    # MCP 官方 SDK(lowlevel Server + stdio 传输)
+    "mcp>=2.2,<3",
+    # 在协议边界按已发布 schema 校验入参(对应上游由模型侧 JSON Schema 强制的层位)
+    "jsonschema>=4.26,<5",
+    # 新版共享工具层在导入时使用 OpenTelemetry SDK
+    "opentelemetry-sdk==1.44.0",
+    "opentelemetry-instrumentation==0.65b0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.4,<9", "pytest-asyncio>=1.3,<2"]
+
+[project.scripts]
+insurance-tools-mcp = "itools.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["app*", "tool_adapter_sdk*", "itools*", "capabilities*"]
+
+[tool.setuptools.package-data]
+app = ["conf/**/*.yaml", "conf/**/*.json"]
+itools = ["tools_spec.json"]
+capabilities = ["*/SKILL.md", "*/manifest*.yaml", "*/routes*.yaml", "*/eval/*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

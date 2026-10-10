@@ -1,0 +1,9 @@
+# 三环境共用；环境差异只在对应环境文件覆盖。
+version: audit-v1
+sink:
+  mode: jsonl
+async_enabled: true
+queue_maxsize: 1024
+max_spool_bytes: 67108864
+# 声明外部留存目标，当前服务不自动清理审计或 spool；由运维管理。
+retention_days: 365

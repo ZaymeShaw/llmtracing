@@ -1,0 +1,18 @@
+{
+  "source": "/absolute/path/to/insurance-qa-agent",
+  "source_note": "Only needed when explicitly syncing upstream source; set this path on your machine before synchronization.",
+  "validation_env": {
+    "ENV_TYPE": "dev",
+    "ITOOLS_AGENT_ID": "itools-sync-validate",
+    "ITOOLS_USER_ID": "1050900009",
+    "ITOOLS_EMPNO": "1050900009",
+    "ITOOLS_AGENTNO": "1050900009"
+  },
+  "probe": {
+    "tool": "customer_search",
+    "arguments": {
+      "query": "伏云平"
+    },
+    "note": "Dataset A01 customer name; read-only query"
+  }
+}

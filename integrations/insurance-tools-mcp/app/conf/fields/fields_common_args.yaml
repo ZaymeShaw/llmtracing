@@ -1,0 +1,75 @@
+# 三环境共用；详情字段与 V5 契约对齐，非详情意图单独分流。
+version: fields-v7
+fields:
+  applicant_name:
+  - 投保人
+  - 投保人姓名
+  insurant_name:
+  - 被保人
+  - 被保险人
+  - 受保人
+  - insured_name
+  year_pay_prem:
+  - 保费
+  - 保险费
+  - 年缴保费
+  - 年交保费
+  - 应缴保费
+  - premium
+  pol_status_desc:
+  - 保单状态
+  - 状态
+  - policy_status
+  pol_product_name:
+  - 保单基本信息
+  - 基本信息
+  - 保单概况
+  - 保单名称
+  - 产品名称
+  - 险种名称
+  - policy_basic_info
+  sum_ins:
+  - 保额
+  - 险种保额
+  - 保险金额
+  pol_effective_date_term:
+  - 生效日期
+  - 生效日
+  - 保单生效日
+  prem_method_desc:
+  - 缴费方式
+  - 交费方式
+  - 缴别
+  cooling_off:
+  - 犹豫期
+  prem_term:
+  - 交费期间
+  - 缴费期间
+  - 缴费年期
+  - 缴费期
+  - 交费年期
+  pay_to_day:
+  - 应缴日
+  pay_record:
+  - 理赔记录
+non_detail_fields:
+  cash_value:
+  - 现金价值
+  - 现价
+  - 账户价值
+  universal_account_balance:
+  - 万能账户余额
+  - 万能余额
+  - 账户余额
+  surrender_value:
+  - 退保金
+  - 退保价值
+  - 退保费用
+  waiting_period:
+  - 等待期
+  - 观察期
+  exclusion_clause:
+  - 免责条款
+  - 免责
+  - 责任免除
+  - 除外责任

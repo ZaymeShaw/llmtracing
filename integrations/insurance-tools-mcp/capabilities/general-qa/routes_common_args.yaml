@@ -1,0 +1,41 @@
+# 三环境共用；环境差异只在对应环境文件覆盖。
+version: routes-general-qa-v1
+anchors:
+  positive:
+  - type: exact
+    value: 犹豫期内退保怎么办理
+    action: DIRECT_RAG
+    tool: general_qa
+  - type: exact
+    value: 理赔需要哪些材料
+    action: DIRECT_RAG
+    tool: general_qa
+  - type: exact
+    value: 理赔要准备什么材料
+    action: DIRECT_RAG
+    tool: general_qa
+  - type: exact
+    value: 理赔怎么申请
+    action: DIRECT_RAG
+    tool: general_qa
+  - type: exact
+    value: 如何变更受益人
+    action: DIRECT_RAG
+    tool: general_qa
+  - type: exact
+    value: 怎么修改联系方式
+    action: DIRECT_RAG
+    tool: general_qa
+  - type: exact
+    value: 保费怎么缴纳
+    action: DIRECT_RAG
+    tool: general_qa
+  - type: exact
+    value: 犹豫期内怎么退保
+    action: DIRECT_RAG
+    tool: general_qa
+  - type: exact
+    value: 怎么下载电子保单
+    action: DIRECT_RAG
+    tool: general_qa
+  negative: []

@@ -1,0 +1,3 @@
+# 数据库连接重启后生效；backend 可在环境文件中覆盖。
+backend: sqlite
+db_file: insurance_qa_agent.db

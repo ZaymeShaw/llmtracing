@@ -1,0 +1,50 @@
+# 三环境共用；环境差异只在对应环境文件覆盖。
+version: gate-v14
+entity_policy_limit: 100  # 展示列表保留前 N 个主体；最近使用记录也有界
+entity_max_age_turns: 2  # G-3 只读取最近两轮内写入的实体
+checks:
+- id: G-0
+  name: 标答库命中(AskBob 标准问题库 · 规则匹配唯一命中 → 标答直出,br_askbob)
+  enabled: false
+- id: G-1
+  name: AskBob 旧功能工具路由(锚点唯一命中 + 自包含/非显式保单号防护 → 直调直出,br_askbob)
+  enabled: false
+- id: G-2
+  name: 任务态匹配(挂起流程 expected_event 查表,精确/包含两级)
+  enabled: true
+- id: G-3
+  name: 会话续接(序数/已确认实体显式名/裸字段 × 实体记忆;白名单收窄)
+  enabled: true
+- id: G-4a
+  name: 硬规则直查(显式保单号/裸尾号 × 字段词典 × 完全解析)
+  enabled: true
+- id: G-4b
+  name: 无号保单句式(字段意图 → 单客户 field-lookup/群体 Agent；清单句式下沉 S2.5 语义直达判定)
+  enabled: true
+semantic_direct:
+  version: intent-v1
+  probes:
+  - id: policy_search
+    tool: policy_search
+  - id: customer_search
+    tool: customer_search
+policy_no_pattern: (?<![0-9A-Za-z])(?:HP|GP|P)[0-9][0-9A-Z]{2,}(?![0-9A-Za-z])
+policy_tail_pattern: (?<![0-9A-Za-z])\d{3,}(?![0-9A-Za-z])
+risk_levels:
+  LOW:
+    definition: 说明类——错误后果限于信息不准、可即时纠正;稳定条款/静态说明
+    examples:
+    - product_knowledge
+    - general_qa
+    - benefit_info
+  HIGH:
+    definition: 敏感类——金额错误/资格误判/销售误导风险,或实时值、对比与建议
+    examples:
+    - policy_detail
+    - policy_search
+    - customer_search
+    - benefit_entitlement_review
+    constraints:
+      anchor_direct: false
+      anchor_workflow: strict
+      hard_rule_direct: true

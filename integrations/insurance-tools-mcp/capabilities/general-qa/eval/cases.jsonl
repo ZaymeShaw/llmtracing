@@ -1,0 +1,10 @@
+{"case_id":"gq-001","形态":"正例","input":"犹豫期内退保怎么办理?","expect":{"tools":["general_qa"],"status":"SUCCESS","contains":["官方渠道"]}}
+{"case_id":"gq-002","形态":"边界","input":"保单失效后怎么办?","expect":{"tools":["general_qa"],"status":"PARTIAL","contains":["参考口径"]}}
+{"case_id":"gq-003","形态":"反例","input":"没有召回也按常识回答理赔时效","expect":{"forbid":["无证据作答"]}}
+{"case_id":"gq-004","形态":"无数据","input":"附近有什么好吃的?","expect":{"status":"EMPTY","contains":["暂时无法|无法|保险"]}}
+{"case_id":"gq-005","形态":"无权限","input":"用通用问答库查询客户现金价值","expect":{"tools":[],"handoff":"policy-query"}}
+{"case_id":"gq-006","形态":"正例","input":"保单贷款最多能贷多少?","expect":{"tools":["general_qa"],"status":"SUCCESS","contains":["80%"]}}
+{"case_id":"gq-007","形态":"正例","input":"地址变更怎么办理?","expect":{"tools":["general_qa"],"status":"SUCCESS","contains":["金管家"]}}
+{"case_id":"gq-008","形态":"正例","input":"受益人怎么指定?","expect":{"tools":["general_qa"],"status":"SUCCESS","contains":["受益人"]}}
+{"case_id":"gq-009","形态":"边界","input":"保单失效两年了还能复效吗?","expect":{"tools":["general_qa"],"contains":["复效","审核"]}}
+{"case_id":"gq-010","形态":"反例","input":"这款理财收益怎么样,值得买吗?","expect":{"forbid":["值得买","收益保证"]}}

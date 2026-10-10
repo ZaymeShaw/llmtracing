@@ -1,0 +1,28 @@
+# 三环境共用；环境差异只在对应环境文件覆盖。
+version: 1
+level: INFO
+logger_levels:
+  agno: WARNING
+  agno-team: WARNING
+  agno-workflow: WARNING
+  httpx: WARNING
+  httpcore: WARNING
+console:
+  format: text
+  datefmt: '%Y-%m-%dT%H:%M:%S.%fZ'
+  template: '%(timestamp)s %(level)s %(logger)s pid=%(process_id)s tid=%(thread_id)s
+    %(pathname)s:%(lineno)s %(func_name)s http=%(http_request_id)s trace=%(trace_id)s
+    rpc=%(request_id)s run=%(run_id)s %(event)s %(message)s %(fields)s %(exception)s'
+file:
+  filename: app.log
+  format: json
+  max_bytes: 1073741824
+  backup_count: 10
+  json_extra_fields:
+  - fields
+  - exception
+queue:
+  capacity_per_sink: 1024
+  max_record_bytes: 16384
+  shutdown_timeout_s: 5
+  diagnostic_interval_s: 30

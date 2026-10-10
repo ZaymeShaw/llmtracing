@@ -1,0 +1,58 @@
+# 仅维护当前环境差异；与同组 common 配置合并。
+handlers:
+  customer_search:
+    url: http://8.148.158.241:8000/llm_ai_agent/client_search_query_parse_no_encipher
+    query_url: http://211.161.232.13:8080/api/v1/customer-search/search
+    timeout_s: 75.0
+    retry:
+      max_retries: 0
+  policy_detail:
+    url: http://211.161.232.13:8080/api/v1/policy-search/detail
+    query_url: http://211.161.232.13:8080/api/v1/policy-search/query
+    timeout_s: 10.0
+    retry:
+      max_retries: 1
+  policy_search:
+    url: http://43.139.190.73/api/v1/policy-search/policy-search-parse
+    query_url: http://211.161.232.13:8080/api/v1/policy-search/query
+    timeout_s: 75.0
+    retry:
+      max_retries: 0
+  customer_detail:
+    url: http://211.161.232.13:8080/api/v1/customer-search/detail-info
+    timeout_s: 10.0
+    retry:
+      max_retries: 1
+  qa_recall:
+    url: http://8.148.158.241:8010/faq_context_search
+    source: askbob
+    timeout_s: 10.0
+    retry:
+      max_retries: 1
+  benefit_detail:
+    url: http://8.148.158.241:8010/service_benefit_search
+    source: quanyi_wiki
+    top_n: 5
+    timeout_s: 10.0
+    retry:
+      max_retries: 1
+  product_resolve:
+    url: http://8.148.158.241:8010/product_query_parse
+    top_n: 5
+    timeout_s: 10.0
+    retry:
+      max_retries: 1
+  product_rag:
+    url: http://8.148.158.241:8010/chunk_context_search
+    source: product_wiki
+    top_n: 5
+    timeout_s: 10.0
+    retry:
+      max_retries: 1
+semantic_direct:
+  enabled: true
+  endpoints:
+    policy_search:
+      url: http://43.139.190.73/api/v1/policy-search/intent
+    customer_search:
+      url: http://8.148.158.241:8000/llm_ai_agent/intent/customer-search

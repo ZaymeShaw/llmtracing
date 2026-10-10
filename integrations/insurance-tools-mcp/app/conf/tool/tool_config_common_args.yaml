@@ -1,0 +1,47 @@
+# 三环境共用；环境差异只在对应环境文件覆盖。
+version: tools-v6
+semantic_direct:
+  endpoints:
+    policy_search:
+      timeout_s: 3.0
+    customer_search:
+      timeout_s: 3.0
+tools:
+  general_qa:
+    recall_top_n: 3
+  policy_search:
+    result_limit: 5
+  customer_search:
+    result_limit: 5
+  policy_detail: {}
+  product_knowledge: {}
+  benefit_info: {}
+  customer_detail: {}
+  ask_clarify:
+    mode: local
+  entity_lookup:
+    mode: local
+qa_score:
+  success_min: 0.75
+  partial_min: 0.45
+error_normalization:
+  denied:
+    status: DENIED
+    code: DENIED
+    retryable: false
+  timeout:
+    status: TIMEOUT
+    code: TIMEOUT
+    retryable: true
+  upstream:
+    status: ERROR
+    code: UPSTREAM
+    retryable: true
+  contract:
+    status: ERROR
+    code: UPSTREAM
+    retryable: false
+  budget:
+    status: ERROR
+    code: BUDGET
+    retryable: false

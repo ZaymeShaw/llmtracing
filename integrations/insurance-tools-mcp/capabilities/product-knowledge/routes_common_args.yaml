@@ -1,0 +1,12 @@
+# 三环境共用；环境差异只在对应环境文件覆盖。
+version: routes-product-knowledge-v0
+anchors:
+  positive:
+  - type: exact
+    value: 平安福21的等待期是多久
+    action: DIRECT_RAG
+    tool: product_knowledge
+  negative:
+  - type: exact
+    value: 这个产品值得买吗
+    action: AGENT

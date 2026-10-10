@@ -1,0 +1,20 @@
+{"case_id":"pq-001","形态":"正例","input":"P002的现金价值是多少?","expect":{"tools":["policy_detail"],"status":"SUCCESS","contains":["125,300.00","2026-08-21"]}}
+{"case_id":"pq-002","形态":"边界","input":"尾号456的现金价值","expect":{"tools":["policy_detail","ask_clarify"],"status":"NEEDS_CLARIFICATION"}}
+{"case_id":"pq-003","形态":"反例","input":"多张候选时随便选第一张","expect":{"forbid":["猜测候选"]}}
+{"case_id":"pq-004","形态":"无数据","input":"P999的现金价值","expect":{"status":"EMPTY","contains":["未查询到"]}}
+{"case_id":"pq-005","形态":"无权限","input":"查询非本人名下保单P2456","expect":{"status":"DENIED","retry":false,"forbid":["王五","66,000"]}}
+{"case_id":"pq-006","形态":"正例","input":"保单 P002 都有哪些信息?","expect":{"tools":["policy_detail"],"status":"SUCCESS","contains":["张三","平安福"]}}
+{"case_id":"pq-007","形态":"边界","input":"尾号456的详细信息","expect":{"tools":["ask_clarify"],"status":"NEEDS_CLARIFICATION"}}
+{"case_id":"pq-008","形态":"无权限","input":"查一下保单 P2456 的详情","expect":{"status":"EMPTY","contains":["未查询到|未找到|没有找到|未能查到"],"forbid":["王五"]}}
+{"case_id":"pq-009","形态":"正例","input":"张三的详细资料","expect":{"tools":["customer_search","customer_detail"],"status":"SUCCESS","contains":["就医绿通"]}}
+{"case_id":"pq-010","形态":"边界","input":"客户的详细资料","expect":{"tools":["ask_clarify"],"status":"NEEDS_CLARIFICATION"}}
+{"case_id":"pq-011","形态":"正例","input":"张三名下保单的年缴保费是多少","expect":{"tools":["run_policy_field_lookup"],"forbid_tools":["present_policy_search_card"]}}
+{"case_id":"pq-012","形态":"边界","input":"李四名下保单的保费是多少","expect":{"tools":["run_policy_field_lookup"],"forbid_tools":["present_policy_search_card"]}}
+{"case_id":"pq-013","形态":"正例","input":"帮我定位张三名下的一张保单，先确认客户再确认保单，最后给我选定保单的摘要","expect":{"tools":["run_policy_field_lookup"],"forbid_tools":["present_policy_search_card"]}}
+{"case_id":"pq-014","形态":"边界","input":"查李四的一张保单摘要，如果有多个客户或保单，请先让我选择","expect":{"tools":["run_policy_field_lookup"],"forbid_tools":["present_policy_search_card"]}}
+{"case_id":"pq-015","形态":"正例","input":"只列出张三名下的保单清单，不需要查询详情","expect":{"tools":["present_policy_search_card"],"forbid_tools":["policy_detail","run_policy_field_lookup"]}}
+{"case_id":"pq-016","形态":"边界","input":"只列出本人名下有效保单清单","expect":{"tools":["present_policy_search_card"],"forbid_tools":["policy_detail","run_policy_field_lookup"]}}
+{"case_id":"pq-017","形态":"正例","input":"只列出本人名下客户清单，不需要客户详情","expect":{"tools":["present_customer_search_card"],"forbid_tools":["customer_detail"]}}
+{"case_id":"pq-018","形态":"边界","input":"只列出本人名下姓张的客户清单","expect":{"tools":["present_customer_search_card"],"forbid_tools":["customer_detail"]}}
+{"case_id":"pq-019","形态":"正例","input":"先查张三名下有哪些保单，再逐张核实现金价值","expect":{"tools":["policy_search"],"forbid_tools":["present_policy_search_card"]}}
+{"case_id":"pq-020","形态":"边界","input":"查李四名下保单，并比较每张保单的保费","expect":{"tools":["policy_search"],"forbid_tools":["present_policy_search_card"]}}

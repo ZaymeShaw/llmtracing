@@ -1,0 +1,21 @@
+version: 1
+disable_existing_loggers: false
+handlers:
+  unified:
+    (): app.observability.bootstrap.build_handler
+root:
+  level: DEBUG
+  handlers: [unified]
+loggers:
+  uvicorn:
+    level: DEBUG
+    handlers: []
+    propagate: true
+  uvicorn.error:
+    level: DEBUG
+    handlers: []
+    propagate: true
+  uvicorn.access:
+    level: DEBUG
+    handlers: []
+    propagate: true

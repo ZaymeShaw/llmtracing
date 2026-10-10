@@ -1,0 +1,20 @@
+# 仅维护当前环境差异；与同组 common 配置合并。
+# 部署前填写本环境全部八个 handler 参数；保持为空会拒绝启动，不回退 dev。
+# 启用语义直达时，另行填写下方判定地址并将 enabled 设为 true。
+handlers: {}
+semantic_direct:
+  enabled: false
+  endpoints:
+    policy_search:
+      url: ''
+    customer_search:
+      url: ''
+
+# 仅作用于已配置的只读 handler；不填补缺失地址、不改变鉴权失败语义。
+handler_defaults:
+  retry:
+    max_retries: 1
+    initial_backoff_s: 0.1
+    max_backoff_s: 0.5
+  max_concurrency: 8
+  admission_wait_s: 1.0

@@ -1,0 +1,3 @@
+# 仅维护当前环境差异；与同组 common 配置合并。
+file:
+  directory: var/log/stg

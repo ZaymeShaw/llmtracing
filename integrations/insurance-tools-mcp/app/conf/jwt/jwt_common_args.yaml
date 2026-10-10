@@ -1,0 +1,14 @@
+# 三环境共用；环境差异只在对应环境文件覆盖。
+version: jwt-v1
+# 鉴权总开关，默认关闭；环境文件可覆盖，修改后重启。
+enabled: false
+algorithm: RS256
+verify_audience: false
+audience: null
+admin_scope: null
+user_isolation: false
+token_issuer:
+  enabled: false
+  access_token_ttl_seconds: 3600
+  signing_private_key_file: null
+  clients: []

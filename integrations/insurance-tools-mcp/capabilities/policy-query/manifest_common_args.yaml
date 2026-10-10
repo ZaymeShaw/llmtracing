@@ -1,0 +1,16 @@
+# 三环境共用；环境差异只在对应环境文件覆盖。
+capability: policy-query
+name: 保单资料查询
+description_for_model: 保单字段查询与无号定位(客户→保单→锁定);金额带数据时点,越权友好告知不重试
+execution_modes:
+- agent
+risk: HIGH
+tools:
+- policy_detail
+- customer_detail
+- run_policy_field_lookup
+- policy_search
+- customer_search
+- ask_clarify
+eval: eval/
+gray_switch: 'off'

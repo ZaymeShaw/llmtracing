@@ -1,0 +1,16 @@
+# 三环境共用；环境差异只在对应环境文件覆盖。
+capability: benefit-service
+name: 服务与权益问答
+description_for_model: 权益详情要素、客户已享权益盘点、资格与差距核对;复用 customer_search × benefit_info 组合(修订七)
+execution_modes:
+- direct
+- agent
+risk: LOW
+tools:
+- entity_lookup
+- customer_search
+- customer_detail
+- benefit_info
+- ask_clarify
+eval: eval/
+gray_switch: 'on'
