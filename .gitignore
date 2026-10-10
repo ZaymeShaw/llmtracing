@@ -18,7 +18,10 @@
 /eval_runs/
 /outputs/
 /eval_harness/data/
-/eval_harness/bundles/
+/eval_harness/bundles/*
+!/eval_harness/bundles/120_prompt_only_0922.jsonl
+!/eval_harness/bundles/120_prompt_only_0922_shared.jsonl
+!/eval_harness/bundles/120_prompt_only_0922_shared_pi.jsonl
 /var/
 /llm_gateway/logs/
 /llm_gateway/run/

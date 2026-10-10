@@ -159,3 +159,104 @@ python -m eval_harness.run --config eval_harness/configs/runs/my_agent.yaml --al
 按 profile 中的 `concurrency: 4` 并发 4 题；同批续跑加 `--resume`，跳过成功题。新批次换 `--run-id`；追踪标识由框架生成。
 
 框架批跑结束后打开 `eval_runs/my_batch/llm_trace.html`。追踪头必须透传到真正的模型请求，中转才知道请求属于哪道题；HTTP harness 不一定需要本地执行目录。
+
+## 用 5 个 harness 跑同一套 120 题
+
+本仓库已附上实际跑批使用的 **0922 题库：A01–F20，共 120 题、174 轮**。每行 JSONL 是一道题，`turns` 按顺序在同一会话中执行；题间新建会话。
+
+| 文件 | 用途 |
+| --- | --- |
+| [120_prompt_only_0922_shared.jsonl](eval_harness/bundles/120_prompt_only_0922_shared.jsonl) | Claude Code、Insurance QA、OpenCode、DSH 共用的题库 |
+| [120_prompt_only_0922_shared_pi.jsonl](eval_harness/bundles/120_prompt_only_0922_shared_pi.jsonl) | Pi 使用；问句和轮次相同，题号增加 `PI_` 前缀，附带映射元信息 |
+| [120_prompt_only_0922.jsonl](eval_harness/bundles/120_prompt_only_0922.jsonl) | 启动器校验用原版，与 shared 文件逐字节相同 |
+
+共享题库 SHA256：`dbf22717b99081fd7aef427c50321acb9537820e3ab544b687d4a8d55c372428`；Pi 版：`c88266625109484cef1782aca78fc65c8d526d90d7911ab645e11a5f35b3523e`。题目保留原文中的客户名和业务查询条件；文件包含题目及来源元信息，MCP 返回、模型回答和运行日志在各次运行后生成。
+
+### 运行前准备
+
+以下命令均在仓库根目录执行。先按前文安装 `llm_gateway/.venv` 和 `eval_harness`，并准备本地依赖：
+
+- **共同配置**：各中转的 `UPSTREAM_*` 指向同一目标。本次实跑为百炼 `dashscope.aliyuncs.com` / `deepseek-v4-flash-0731`，thinking off；提示词使用仓库内的 `workspaces/*/agent.md`，MCP 指向同一 insurance-tools 后端。
+- **Claude / Pi**：安装 `claude`、`pi` CLI，准备 `workspaces/claude/.mcp.json`、`workspaces/pi/.mcp.json`。Claude 的 `.claude/settings.local.json` 和 Pi 的 `local-relay` provider 指向主中转；Pi 注册的客户端模型别名为 `deepseek-v4-flash`，实际上游由中转配置决定。
+- **OpenCode**：准备 `llm_gateway/.env.opencode_4003`，设置 `OPENCODE_BINARY`、`OPENCODE_MCP_CONFIG`、`OPENCODE_AGENT_PROMPT` 和 `OPENCODE_BUNDLE`；题库路径指向上表 shared 文件。
+- **Insurance**：准备外部 `insurance-qa-agent-eval` 项目及其 Python 环境、`insurance` lane pool，其中包含 `insurance_4002`（业务地址 `http://127.0.0.1:18063/v1/chat`）。换机器需调整 [run_tracing_120.py](scripts/run_tracing_120.py) 的 `QA_ROOT`、`QA_PYTHON` 本地路径。每条 lane 的 QA 服务必须指向该 lane 的模型中转。
+- **DSH**：准备已构建的 DeepSeek Harness checkout、对应 Node，以及 `dsh_smoke` lane pool；配置步骤见 [DSH lane quickstart](docs/dsh-lane-quickstart.md)。下方 `DSH_CHECKOUT` 改为实际目录，`DSH_NODE` 改为构建该 checkout 所用的 Node。
+
+私有 `.env`、MCP 凭据、CLI 用户配置和外部 harness 安装由本机提供。前四个 harness 的启动器目前会统一检查四套依赖，即使指定 `--harness`，也需先配齐上述四套配置；实际执行时只启动选中的服务。先做本地检查（不启动服务、不调用模型）：
+
+```bash
+bash scripts/run_tracing_120.sh --check
+```
+
+### Claude Code
+
+```bash
+bash scripts/run_tracing_120.sh --all --harness claude \
+  --concurrency 4 --out eval_runs/claude_120_run1 --no-open
+```
+
+报告：`eval_runs/claude_120_run1/dual_datasetA_full/claude/llm_trace.html`。
+
+### Pi
+
+```bash
+bash scripts/run_tracing_120.sh --all --harness pi \
+  --concurrency 4 --out eval_runs/pi_120_run1 --no-open
+```
+
+报告：`eval_runs/pi_120_run1/triple_datasetA_full/pi/llm_trace.html`；题号显示为 `PI_A01` 等。
+
+### OpenCode
+
+```bash
+bash scripts/run_tracing_120.sh --all --harness opencode \
+  --concurrency 4 --out eval_runs/opencode_120_run1 --no-open
+```
+
+报告：`eval_runs/opencode_120_run1/triple_datasetA_full/opencode/llm_trace.html`。此入口调用 OpenCode 原生 CLI，并从专属中转导出 tracing。
+
+### Insurance QA
+
+```bash
+bash scripts/run_tracing_120.sh --all --harness insurance \
+  --out eval_runs/insurance_120_run1 --no-open
+```
+
+报告：`eval_runs/insurance_120_run1/dual_datasetA_full/insurance/llm_trace.html`；题号显示为 `INS_A01` 等。并发度由 `insurance` pool 的 lane 数决定，每条 lane 同时一题，`--concurrency` 不控制 Insurance。启动器会启动所需的 QA 实例，结束后只停止本次创建的 QA 实例。
+
+上面四条命令均先运行 A01、C20、F13 三题 smoke，通过后再执行完整 120 题；因此每套实际包含额外 3 次 smoke 题目执行及 preflight 探测。新批次换一个 `--out` 目录；中断后用原目录续跑，例如：
+
+```bash
+bash scripts/run_tracing_120.sh --resume eval_runs/pi_120_run1 --no-open
+```
+
+最近一次 Insurance 比较批次使用额外的独占单 lane（4111 → QA 18071）和逐题请求闭合审计；上面的命令是维护中的标准 `insurance` pool 入口，不会自动恢复那个临时批次的端口或审计脚本。标准入口的依赖、失败处理和四套一起运行方式见 [120 题运行说明](docs/run_tracing_120.md)。
+
+### DeepSeek Harness（DSH）
+
+```bash
+DSH_CHECKOUT="../dsh/deepseek-harness"
+DSH_NODE="node"
+
+llm_gateway/.venv/bin/python llmtrace gateway up dsh_smoke
+
+llm_gateway/.venv/bin/python scripts/run_dsh_wire.py \
+  --dsh-checkout "$DSH_CHECKOUT" --node "$DSH_NODE" \
+  --lanes dsh_smoke \
+  --bundle eval_harness/bundles/120_prompt_only_0922_shared.jsonl \
+  --mcp-config workspaces/pi/.mcp.json \
+  --agent-prompt workspaces/pi/agent.md \
+  --thinking off --max-tokens 8192 --timeout 600 --turn-timeout 300 \
+  --run-id dsh_120_run1
+```
+
+报告：`eval_runs/dsh_120_run1/llm_trace.html`。DSH 不带 `--cases` 即运行题库全部 120 题，按 lane 数并发；每条 lane 独占一个原生 SDK worker。此命令直接跑全量，不自动执行 smoke；首次接入可先加 `--cases A01,C20,F13` 并换用单独的 run ID。DSH 当前要求每批使用新的 run ID，不支持前四套启动器的 `--resume`。
+
+完成后可复核 DSH 采集完整性，并在没有其他任务使用这些 lane 时停止网关：
+
+```bash
+llm_gateway/.venv/bin/python scripts/verify_dsh_run.py eval_runs/dsh_120_run1
+llm_gateway/.venv/bin/python llmtrace gateway down dsh_smoke
+```
+
+五套入口均保留各 harness 原生执行逻辑。新逐题调用归档默认使用无损 `llm_calls.jsonl.gz`，HTML 按原流程生成；运行状态、采集完整性和业务答案准确率应分别判断。
